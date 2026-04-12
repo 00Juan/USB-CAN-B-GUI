@@ -9,20 +9,23 @@ Features:
 
 from __future__ import annotations
 
+import csv
 import ctypes
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 
 VCI_USBCAN2 = 4
 STATUS_OK = 1
 MAX_CAN_DATA_LEN = 8
+MAX_RX_HISTORY = 20000
 
 
 class VCI_INIT_CONFIG(ctypes.Structure):
@@ -71,6 +74,7 @@ class MessageTemplate:
     remote: bool
     dlc: int
     data: list[int]
+    period_ms: int = 0
 
 
 class CanGuiApp(tk.Tk):
@@ -82,11 +86,21 @@ class CanGuiApp(tk.Tk):
 
         self.api_lock = threading.Lock()
         self.rx_queue: queue.Queue[tuple] = queue.Queue()
+        self.ui_event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.stop_event = threading.Event()
         self.rx_thread: threading.Thread | None = None
+        self.periodic_stop_event = threading.Event()
+        self.periodic_thread: threading.Thread | None = None
+        self.periodic_running = False
+
+        self.self_test_waiters_lock = threading.Lock()
+        self.self_test_waiters: list[dict[str, object]] = []
+        self.self_test_running = False
 
         self.connected = False
         self.templates_by_item: dict[str, MessageTemplate] = {}
+        self.rx_records_can1: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
+        self.rx_records_can2: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
 
         self.lib_path_var = tk.StringVar(value=self._default_lib_path())
         self.baud_var = tk.StringVar(value="125K")
@@ -99,6 +113,7 @@ class CanGuiApp(tk.Tk):
         self.remote_var = tk.IntVar(value=0)
         self.dlc_var = tk.IntVar(value=8)
         self.data_var = tk.StringVar(value="01 02 03 04 05 06 07 08")
+        self.period_ms_var = tk.IntVar(value=0)
 
         self.dll = None
 
@@ -184,6 +199,9 @@ class CanGuiApp(tk.Tk):
         self.disconnect_btn = ttk.Button(frame, text="Disconnect", command=self.disconnect_device)
         self.disconnect_btn.grid(row=0, column=5, sticky=tk.EW, padx=(6, 0))
 
+        self.self_test_btn = ttk.Button(frame, text="Self Test", command=self.run_self_test)
+        self.self_test_btn.grid(row=0, column=6, sticky=tk.EW, padx=(6, 0))
+
         frame.columnconfigure(1, weight=1)
 
     def _build_message_panel(self, parent: ttk.Frame) -> None:
@@ -229,6 +247,15 @@ class CanGuiApp(tk.Tk):
         self.data_entry = ttk.Entry(form, textvariable=self.data_var)
         self.data_entry.grid(row=1, column=3, columnspan=5, sticky=tk.EW, padx=(6, 12), pady=(8, 0))
 
+        ttk.Label(form, text="Period (ms):").grid(row=1, column=6, sticky=tk.W, pady=(8, 0))
+        ttk.Spinbox(
+            form,
+            from_=0,
+            to=600000,
+            textvariable=self.period_ms_var,
+            width=10,
+        ).grid(row=1, column=7, sticky=tk.W, pady=(8, 0))
+
         button_row = ttk.Frame(outer)
         button_row.pack(fill=tk.X, pady=(10, 0))
 
@@ -248,7 +275,21 @@ class CanGuiApp(tk.Tk):
         )
         self.send_selected_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        columns = ("name", "if", "id", "format", "type", "dlc", "data")
+        self.start_periodic_btn = ttk.Button(
+            button_row,
+            text="Start Periodic",
+            command=self.start_periodic_tx,
+        )
+        self.start_periodic_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.stop_periodic_btn = ttk.Button(
+            button_row,
+            text="Stop Periodic",
+            command=self.stop_periodic_tx,
+        )
+        self.stop_periodic_btn.pack(side=tk.LEFT, padx=(6, 0))
+
+        columns = ("name", "if", "id", "format", "type", "dlc", "period", "data")
         self.template_tree = ttk.Treeview(outer, columns=columns, show="headings", height=7)
         self.template_tree.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
@@ -259,6 +300,7 @@ class CanGuiApp(tk.Tk):
             "format": "Format",
             "type": "Type",
             "dlc": "DLC",
+            "period": "Period (ms)",
             "data": "Data",
         }
         widths = {
@@ -268,7 +310,8 @@ class CanGuiApp(tk.Tk):
             "format": 90,
             "type": 80,
             "dlc": 60,
-            "data": 360,
+            "period": 100,
+            "data": 280,
         }
 
         for key in columns:
@@ -285,8 +328,10 @@ class CanGuiApp(tk.Tk):
 
         row = ttk.Frame(outer)
         row.pack(fill=tk.X)
-        ttk.Button(row, text="Clear CAN1", command=lambda: self._clear_text(self.rx_text_can1)).pack(side=tk.LEFT)
-        ttk.Button(row, text="Clear CAN2", command=lambda: self._clear_text(self.rx_text_can2)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row, text="Clear CAN1", command=self.clear_can1_log).pack(side=tk.LEFT)
+        ttk.Button(row, text="Clear CAN2", command=self.clear_can2_log).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row, text="Export CAN1 CSV", command=lambda: self.export_rx_csv(0)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row, text="Export CAN2 CSV", command=lambda: self.export_rx_csv(1)).pack(side=tk.LEFT, padx=(6, 0))
 
         logs = ttk.Frame(outer)
         logs.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -304,9 +349,13 @@ class CanGuiApp(tk.Tk):
     def _set_connected_ui(self, connected: bool) -> None:
         self.connect_btn.configure(state=tk.DISABLED if connected else tk.NORMAL)
         self.disconnect_btn.configure(state=tk.NORMAL if connected else tk.DISABLED)
+        self.self_test_btn.configure(state=tk.NORMAL if connected and not self.self_test_running else tk.DISABLED)
 
         for btn in (self.send_btn, self.send_selected_btn):
             btn.configure(state=tk.NORMAL if connected else tk.DISABLED)
+
+        self.start_periodic_btn.configure(state=tk.NORMAL if connected and not self.periodic_running else tk.DISABLED)
+        self.stop_periodic_btn.configure(state=tk.NORMAL if connected and self.periodic_running else tk.DISABLED)
 
     def _on_remote_toggle(self) -> None:
         if self.remote_var.get():
@@ -413,6 +462,8 @@ class CanGuiApp(tk.Tk):
         if not self.connected:
             return
 
+        self.stop_periodic_tx(wait=True)
+
         self.stop_event.set()
         if self.rx_thread and self.rx_thread.is_alive():
             self.rx_thread.join(timeout=1.5)
@@ -510,9 +561,90 @@ class CanGuiApp(tk.Tk):
             target = self.rx_text_can1 if channel == 0 else self.rx_text_can2
             target.insert(tk.END, line)
             target.see(tk.END)
+
+            record = {
+                "host_time": now,
+                "channel": channel + 1,
+                "id_hex": f"0x{frame_id:X}",
+                "id_dec": frame_id,
+                "format": frame_type,
+                "type": data_kind,
+                "dlc": dlc,
+                "data": data_text,
+                "timestamp_hex": f"0x{timestamp:08X}",
+                "timestamp_dec": timestamp,
+            }
+            if channel == 0:
+                self.rx_records_can1.append(record)
+            else:
+                self.rx_records_can2.append(record)
+
+            self._notify_self_test_waiters(channel, frame_id, bool(ext), bool(remote), dlc, payload)
             count += 1
 
+        self._drain_ui_event_queue()
+
         self.after(50, self._process_rx_queue)
+
+    def _drain_ui_event_queue(self) -> None:
+        max_batch = 100
+        count = 0
+
+        while count < max_batch:
+            try:
+                kind, text = self.ui_event_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if kind == "error":
+                self._set_status(text)
+                messagebox.showerror("CAN Error", text)
+            elif kind == "periodic_done":
+                self.periodic_running = False
+                self._set_connected_ui(self.connected)
+                self._set_status(text)
+            elif kind == "self_test_result":
+                self.self_test_running = False
+                self._set_connected_ui(self.connected)
+                self._set_status(text)
+                if text.startswith("PASS"):
+                    messagebox.showinfo("Self Test", text)
+                else:
+                    messagebox.showwarning("Self Test", text)
+
+            count += 1
+
+    def _notify_self_test_waiters(
+        self,
+        channel: int,
+        frame_id: int,
+        extended: bool,
+        remote: bool,
+        dlc: int,
+        payload: list[int],
+    ) -> None:
+        with self.self_test_waiters_lock:
+            for waiter in self.self_test_waiters:
+                event = waiter["event"]
+                if not isinstance(event, threading.Event) or event.is_set():
+                    continue
+
+                if channel != waiter["channel"]:
+                    continue
+                if frame_id != waiter["frame_id"]:
+                    continue
+                if extended != waiter["extended"]:
+                    continue
+                if remote != waiter["remote"]:
+                    continue
+                if dlc != waiter["dlc"]:
+                    continue
+
+                expected_payload = waiter["payload"]
+                if isinstance(expected_payload, list) and payload != expected_payload:
+                    continue
+
+                event.set()
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
@@ -523,6 +655,10 @@ class CanGuiApp(tk.Tk):
         frame_id = self._parse_can_id(self.id_var.get().strip(), bool(self.extended_var.get()))
         extended = bool(self.extended_var.get())
         remote = bool(self.remote_var.get())
+        period_ms = int(self.period_ms_var.get())
+
+        if period_ms < 0:
+            raise ValueError("Period must be 0 or greater")
 
         dlc = int(self.dlc_var.get())
         if dlc < 0 or dlc > MAX_CAN_DATA_LEN:
@@ -542,6 +678,7 @@ class CanGuiApp(tk.Tk):
             remote=remote,
             dlc=dlc,
             data=data,
+            period_ms=period_ms,
         )
 
     def _parse_can_id(self, text: str, extended: bool) -> int:
@@ -594,6 +731,7 @@ class CanGuiApp(tk.Tk):
             "EXT" if msg.extended else "STD",
             "RTR" if msg.remote else "DATA",
             str(msg.dlc),
+            str(msg.period_ms),
             " ".join(f"{b:02X}" for b in msg.data),
         )
 
@@ -643,6 +781,7 @@ class CanGuiApp(tk.Tk):
         self.extended_var.set(1 if msg.extended else 0)
         self.remote_var.set(1 if msg.remote else 0)
         self.dlc_var.set(msg.dlc)
+        self.period_ms_var.set(msg.period_ms)
         self.data_var.set(" ".join(f"{byte:02X}" for byte in msg.data))
         self._on_remote_toggle()
 
@@ -664,7 +803,7 @@ class CanGuiApp(tk.Tk):
 
         return frame
 
-    def _send_message(self, msg: MessageTemplate) -> None:
+    def _transmit_message(self, msg: MessageTemplate) -> None:
         if not self.connected or not self.dll:
             raise RuntimeError("Device is not connected")
 
@@ -674,6 +813,9 @@ class CanGuiApp(tk.Tk):
 
         if sent != 1:
             raise RuntimeError(f"VCI_Transmit failed on CAN{msg.channel + 1}")
+
+    def _send_message(self, msg: MessageTemplate) -> None:
+        self._transmit_message(msg)
 
         channel_text = f"CAN{msg.channel + 1}"
         data_text = " ".join(f"{b:02X}" for b in msg.data)
@@ -709,6 +851,268 @@ class CanGuiApp(tk.Tk):
                 return
 
         self._set_status(f"Sent {sent} template(s)")
+
+    def start_periodic_tx(self) -> None:
+        if not self.connected:
+            messagebox.showwarning("Periodic TX", "Connect the device before starting periodic transmit")
+            return
+
+        if self.periodic_running:
+            messagebox.showinfo("Periodic TX", "Periodic transmit is already running")
+            return
+
+        selected = self.template_tree.selection()
+        if not selected:
+            messagebox.showinfo("Periodic TX", "Select one or more templates")
+            return
+
+        tasks: list[dict[str, object]] = []
+        skipped_names: list[str] = []
+        for item in selected:
+            msg = self.templates_by_item.get(item)
+            if not msg:
+                continue
+            if msg.period_ms <= 0:
+                skipped_names.append(msg.name)
+                continue
+
+            tasks.append(
+                {
+                    "name": msg.name,
+                    "msg": msg,
+                    "period_ms": msg.period_ms,
+                    "next_due": time.monotonic(),
+                }
+            )
+
+        if not tasks:
+            messagebox.showwarning("Periodic TX", "No selected templates have Period (ms) > 0")
+            return
+
+        self.periodic_stop_event.clear()
+        self.periodic_running = True
+        self._set_connected_ui(self.connected)
+        self.periodic_thread = threading.Thread(
+            target=self._periodic_loop,
+            args=(tasks,),
+            name="can-periodic",
+            daemon=True,
+        )
+        self.periodic_thread.start()
+
+        if skipped_names:
+            self._set_status(
+                f"Periodic TX started for {len(tasks)} template(s), skipped: {', '.join(skipped_names)}"
+            )
+        else:
+            self._set_status(f"Periodic TX started for {len(tasks)} template(s)")
+
+    def stop_periodic_tx(self, wait: bool = False) -> None:
+        if not self.periodic_running:
+            return
+
+        self.periodic_stop_event.set()
+        if wait and self.periodic_thread and self.periodic_thread.is_alive():
+            self.periodic_thread.join(timeout=1.5)
+
+        if not self.periodic_thread or not self.periodic_thread.is_alive():
+            self.periodic_running = False
+            self._set_connected_ui(self.connected)
+
+    def _periodic_loop(self, tasks: list[dict[str, object]]) -> None:
+        sent_count = 0
+
+        while not self.periodic_stop_event.is_set():
+            now = time.monotonic()
+            next_due = None
+
+            for task in tasks:
+                task_next_due = float(task["next_due"])
+                if now >= task_next_due:
+                    try:
+                        msg = task["msg"]
+                        if not isinstance(msg, MessageTemplate):
+                            continue
+                        self._transmit_message(msg)
+                        sent_count += 1
+                    except Exception as exc:
+                        self.ui_event_queue.put(("error", f"Periodic TX error: {exc}"))
+                        self.periodic_stop_event.set()
+                        break
+
+                    period_ms = int(task["period_ms"])
+                    task["next_due"] = now + (period_ms / 1000.0)
+
+                if next_due is None or float(task["next_due"]) < next_due:
+                    next_due = float(task["next_due"])
+
+            if self.periodic_stop_event.is_set():
+                break
+
+            if next_due is None:
+                break
+
+            sleep_s = max(0.001, min(0.05, next_due - time.monotonic()))
+            self.periodic_stop_event.wait(timeout=sleep_s)
+
+        self.ui_event_queue.put(("periodic_done", f"Periodic TX stopped, sent {sent_count} frame(s)"))
+
+    def run_self_test(self) -> None:
+        if not self.connected:
+            messagebox.showwarning("Self Test", "Connect the device before running self-test")
+            return
+
+        if self.self_test_running:
+            messagebox.showinfo("Self Test", "Self-test is already running")
+            return
+
+        self.self_test_running = True
+        self._set_connected_ui(self.connected)
+        self._set_status("Self-test running...")
+
+        threading.Thread(target=self._self_test_worker, name="can-self-test", daemon=True).start()
+
+    def _self_test_worker(self) -> None:
+        frame_can1 = MessageTemplate(
+            name="SelfTest CAN1->CAN2",
+            channel=0,
+            frame_id=0x5A1,
+            extended=False,
+            remote=False,
+            dlc=4,
+            data=[0x11, 0x22, 0x33, 0x44],
+            period_ms=0,
+        )
+        frame_can2 = MessageTemplate(
+            name="SelfTest CAN2->CAN1",
+            channel=1,
+            frame_id=0x5A2,
+            extended=False,
+            remote=False,
+            dlc=4,
+            data=[0xAA, 0xBB, 0xCC, 0xDD],
+            period_ms=0,
+        )
+
+        wait_can2 = threading.Event()
+        wait_can1 = threading.Event()
+        waiters = [
+            {
+                "event": wait_can2,
+                "channel": 1,
+                "frame_id": frame_can1.frame_id,
+                "extended": frame_can1.extended,
+                "remote": frame_can1.remote,
+                "dlc": frame_can1.dlc,
+                "payload": frame_can1.data,
+            },
+            {
+                "event": wait_can1,
+                "channel": 0,
+                "frame_id": frame_can2.frame_id,
+                "extended": frame_can2.extended,
+                "remote": frame_can2.remote,
+                "dlc": frame_can2.dlc,
+                "payload": frame_can2.data,
+            },
+        ]
+
+        with self.self_test_waiters_lock:
+            self.self_test_waiters.extend(waiters)
+
+        try:
+            self._transmit_message(frame_can1)
+            time.sleep(0.03)
+            self._transmit_message(frame_can2)
+
+            can2_ok = wait_can2.wait(timeout=2.0)
+            can1_ok = wait_can1.wait(timeout=2.0)
+
+            if can1_ok and can2_ok:
+                self.ui_event_queue.put(("self_test_result", "PASS: CAN1<->CAN2 loopback verified"))
+            else:
+                missing = []
+                if not can2_ok:
+                    missing.append("CAN2 did not receive CAN1 self-test frame")
+                if not can1_ok:
+                    missing.append("CAN1 did not receive CAN2 self-test frame")
+                self.ui_event_queue.put(("self_test_result", f"FAIL: {'; '.join(missing)}"))
+        except Exception as exc:
+            self.ui_event_queue.put(("self_test_result", f"FAIL: self-test transmit error: {exc}"))
+        finally:
+            with self.self_test_waiters_lock:
+                for waiter in waiters:
+                    if waiter in self.self_test_waiters:
+                        self.self_test_waiters.remove(waiter)
+
+    def export_rx_csv(self, channel: int) -> None:
+        if channel == 0:
+            records = list(self.rx_records_can1)
+            channel_name = "CAN1"
+        else:
+            records = list(self.rx_records_can2)
+            channel_name = "CAN2"
+
+        if not records:
+            messagebox.showinfo("Export CSV", f"No {channel_name} packets to export")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{channel_name.lower()}_rx_{timestamp}.csv"
+        target_path = filedialog.asksaveasfilename(
+            title=f"Export {channel_name} RX to CSV",
+            defaultextension=".csv",
+            initialfile=default_name,
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+
+        if not target_path:
+            return
+
+        with open(target_path, "w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(
+                [
+                    "host_time",
+                    "channel",
+                    "id_hex",
+                    "id_dec",
+                    "format",
+                    "type",
+                    "dlc",
+                    "data",
+                    "timestamp_hex",
+                    "timestamp_dec",
+                ]
+            )
+
+            for record in records:
+                writer.writerow(
+                    [
+                        record["host_time"],
+                        record["channel"],
+                        record["id_hex"],
+                        record["id_dec"],
+                        record["format"],
+                        record["type"],
+                        record["dlc"],
+                        record["data"],
+                        record["timestamp_hex"],
+                        record["timestamp_dec"],
+                    ]
+                )
+
+        self._set_status(f"Exported {len(records)} {channel_name} packet(s) to CSV")
+
+    def clear_can1_log(self) -> None:
+        self._clear_text(self.rx_text_can1)
+        self.rx_records_can1.clear()
+        self._set_status("Cleared CAN1 RX log")
+
+    def clear_can2_log(self) -> None:
+        self._clear_text(self.rx_text_can2)
+        self.rx_records_can2.clear()
+        self._set_status("Cleared CAN2 RX log")
 
     def _clear_text(self, widget: tk.Text) -> None:
         widget.delete("1.0", tk.END)
