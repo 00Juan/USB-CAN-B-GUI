@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import queue
+import struct
 import threading
 import time
 from collections import deque
@@ -65,6 +66,52 @@ BAUD_TO_TIMING = {
 }
 
 
+DECODE_ALIAS_TO_BASE = {
+    "bool": "bool",
+    "boolean": "bool",
+    "byte": "u8",
+    "u8": "u8",
+    "uint8": "u8",
+    "unsigned8": "u8",
+    "i8": "i8",
+    "int8": "i8",
+    "u16": "u16",
+    "uint16": "u16",
+    "unsigned16": "u16",
+    "i16": "i16",
+    "int16": "i16",
+    "u32": "u32",
+    "uint32": "u32",
+    "unsigned": "u32",
+    "uint": "u32",
+    "i32": "i32",
+    "int32": "i32",
+    "int": "i32",
+    "u64": "u64",
+    "uint64": "u64",
+    "unsigned64": "u64",
+    "i64": "i64",
+    "int64": "i64",
+    "float": "f32",
+    "f32": "f32",
+    "double": "f64",
+    "f64": "f64",
+}
+
+DECODE_BASE_INFO = {
+    "u8": ("B", 1),
+    "i8": ("b", 1),
+    "u16": ("H", 2),
+    "i16": ("h", 2),
+    "u32": ("I", 4),
+    "i32": ("i", 4),
+    "u64": ("Q", 8),
+    "i64": ("q", 8),
+    "f32": ("f", 4),
+    "f64": ("d", 8),
+}
+
+
 @dataclass
 class MessageTemplate:
     name: str
@@ -74,6 +121,7 @@ class MessageTemplate:
     remote: bool
     dlc: int
     data: list[int]
+    decode_spec: str = ""
     period_ms: int = 0
 
 
@@ -86,7 +134,7 @@ class CanGuiApp(tk.Tk):
 
         self.api_lock = threading.Lock()
         self.rx_queue: queue.Queue[tuple] = queue.Queue()
-        self.ui_event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.ui_event_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
         self.rx_thread: threading.Thread | None = None
         self.periodic_stop_event = threading.Event()
@@ -99,6 +147,9 @@ class CanGuiApp(tk.Tk):
 
         self.connected = False
         self.templates_by_item: dict[str, MessageTemplate] = {}
+        self.decode_specs_by_id: dict[int, str] = {}
+        self.grouped_packets_by_id: dict[int, dict[str, object]] = {}
+        self.group_tree_items: dict[int, str] = {}
         self.rx_records_can1: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
         self.rx_records_can2: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
 
@@ -113,6 +164,7 @@ class CanGuiApp(tk.Tk):
         self.remote_var = tk.IntVar(value=0)
         self.dlc_var = tk.IntVar(value=8)
         self.data_var = tk.StringVar(value="01 02 03 04 05 06 07 08")
+        self.decode_var = tk.StringVar(value="")
         self.period_ms_var = tk.IntVar(value=0)
 
         self.dll = None
@@ -247,6 +299,23 @@ class CanGuiApp(tk.Tk):
         self.data_entry = ttk.Entry(form, textvariable=self.data_var)
         self.data_entry.grid(row=1, column=3, columnspan=5, sticky=tk.EW, padx=(6, 12), pady=(8, 0))
 
+        ttk.Label(form, text="Decode spec:").grid(row=2, column=0, sticky=tk.W, pady=(8, 0))
+        ttk.Entry(form, textvariable=self.decode_var).grid(
+            row=2,
+            column=1,
+            columnspan=5,
+            sticky=tk.EW,
+            padx=(6, 12),
+            pady=(8, 0),
+        )
+        ttk.Label(form, text="e.g. count:u16, ok:bool, temp:float").grid(
+            row=2,
+            column=6,
+            columnspan=2,
+            sticky=tk.W,
+            pady=(8, 0),
+        )
+
         ttk.Label(form, text="Period (ms):").grid(row=1, column=6, sticky=tk.W, pady=(8, 0))
         ttk.Spinbox(
             form,
@@ -289,7 +358,7 @@ class CanGuiApp(tk.Tk):
         )
         self.stop_periodic_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        columns = ("name", "if", "id", "format", "type", "dlc", "period", "data")
+        columns = ("name", "if", "id", "format", "type", "dlc", "period", "decode", "data")
         self.template_tree = ttk.Treeview(outer, columns=columns, show="headings", height=7)
         self.template_tree.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
 
@@ -301,6 +370,7 @@ class CanGuiApp(tk.Tk):
             "type": "Type",
             "dlc": "DLC",
             "period": "Period (ms)",
+            "decode": "Decode Spec",
             "data": "Data",
         }
         widths = {
@@ -311,7 +381,8 @@ class CanGuiApp(tk.Tk):
             "type": 80,
             "dlc": 60,
             "period": 100,
-            "data": 280,
+            "decode": 220,
+            "data": 220,
         }
 
         for key in columns:
@@ -332,9 +403,18 @@ class CanGuiApp(tk.Tk):
         ttk.Button(row, text="Clear CAN2", command=self.clear_can2_log).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row, text="Export CAN1 CSV", command=lambda: self.export_rx_csv(0)).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row, text="Export CAN2 CSV", command=lambda: self.export_rx_csv(1)).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row, text="Clear Grouped", command=self.clear_grouped_view).pack(side=tk.LEFT, padx=(6, 0))
 
-        logs = ttk.Frame(outer)
-        logs.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        raw_tab = ttk.Frame(notebook)
+        grouped_tab = ttk.Frame(notebook)
+        notebook.add(raw_tab, text="Raw RX")
+        notebook.add(grouped_tab, text="Grouped by CAN ID")
+
+        logs = ttk.Frame(raw_tab)
+        logs.pack(fill=tk.BOTH, expand=True)
 
         can1_frame = ttk.LabelFrame(logs, text="CAN1 RX")
         can1_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
@@ -345,6 +425,53 @@ class CanGuiApp(tk.Tk):
         can2_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
         self.rx_text_can2 = tk.Text(can2_frame, height=14, wrap="none")
         self.rx_text_can2.pack(fill=tk.BOTH, expand=True)
+
+        grouped_columns = (
+            "id",
+            "format",
+            "type",
+            "tx_count",
+            "rx_count",
+            "last_dir",
+            "last_if",
+            "dlc",
+            "raw",
+            "decoded",
+            "last_seen",
+        )
+        self.group_tree = ttk.Treeview(grouped_tab, columns=grouped_columns, show="headings", height=14)
+        self.group_tree.pack(fill=tk.BOTH, expand=True)
+
+        grouped_headings = {
+            "id": "CAN ID",
+            "format": "Format",
+            "type": "Type",
+            "tx_count": "TX",
+            "rx_count": "RX",
+            "last_dir": "Last Dir",
+            "last_if": "Last IF",
+            "dlc": "DLC",
+            "raw": "Last Raw Data",
+            "decoded": "Decoded",
+            "last_seen": "Last Seen",
+        }
+        grouped_widths = {
+            "id": 90,
+            "format": 70,
+            "type": 70,
+            "tx_count": 55,
+            "rx_count": 55,
+            "last_dir": 70,
+            "last_if": 70,
+            "dlc": 50,
+            "raw": 180,
+            "decoded": 320,
+            "last_seen": 115,
+        }
+
+        for key in grouped_columns:
+            self.group_tree.heading(key, text=grouped_headings[key])
+            self.group_tree.column(key, width=grouped_widths[key], anchor=tk.W)
 
     def _set_connected_ui(self, connected: bool) -> None:
         self.connect_btn.configure(state=tk.DISABLED if connected else tk.NORMAL)
@@ -571,14 +698,29 @@ class CanGuiApp(tk.Tk):
                 "type": data_kind,
                 "dlc": dlc,
                 "data": data_text,
+                "decoded": "",
                 "timestamp_hex": f"0x{timestamp:08X}",
                 "timestamp_dec": timestamp,
             }
+            try:
+                record["decoded"] = self._decode_payload(frame_id, payload)
+            except Exception as exc:
+                record["decoded"] = f"decode-error: {exc}"
+
             if channel == 0:
                 self.rx_records_can1.append(record)
             else:
                 self.rx_records_can2.append(record)
 
+            self._record_grouped_packet(
+                direction="RX",
+                channel=channel,
+                frame_id=frame_id,
+                extended=bool(ext),
+                remote=bool(remote),
+                dlc=dlc,
+                payload=payload,
+            )
             self._notify_self_test_waiters(channel, frame_id, bool(ext), bool(remote), dlc, payload)
             count += 1
 
@@ -592,18 +734,21 @@ class CanGuiApp(tk.Tk):
 
         while count < max_batch:
             try:
-                kind, text = self.ui_event_queue.get_nowait()
+                kind, payload = self.ui_event_queue.get_nowait()
             except queue.Empty:
                 break
 
             if kind == "error":
+                text = str(payload)
                 self._set_status(text)
                 messagebox.showerror("CAN Error", text)
             elif kind == "periodic_done":
+                text = str(payload)
                 self.periodic_running = False
                 self._set_connected_ui(self.connected)
                 self._set_status(text)
             elif kind == "self_test_result":
+                text = str(payload)
                 self.self_test_running = False
                 self._set_connected_ui(self.connected)
                 self._set_status(text)
@@ -611,6 +756,19 @@ class CanGuiApp(tk.Tk):
                     messagebox.showinfo("Self Test", text)
                 else:
                     messagebox.showwarning("Self Test", text)
+            elif kind == "group_event":
+                event = payload
+                if isinstance(event, dict):
+                    self._record_grouped_packet(
+                        direction=str(event.get("direction", "RX")),
+                        channel=int(event.get("channel", 0)),
+                        frame_id=int(event.get("frame_id", 0)),
+                        extended=bool(event.get("extended", False)),
+                        remote=bool(event.get("remote", False)),
+                        dlc=int(event.get("dlc", 0)),
+                        payload=list(event.get("payload", [])),
+                        decode_spec=(str(event.get("decode_spec")) if event.get("decode_spec") is not None else None),
+                    )
 
             count += 1
 
@@ -646,6 +804,193 @@ class CanGuiApp(tk.Tk):
 
                 event.set()
 
+    def _split_decode_field(self, field_text: str, index: int) -> tuple[str, str]:
+        text = field_text.strip()
+        if not text:
+            raise ValueError("decode field is empty")
+
+        if ":" in text:
+            left, right = text.split(":", 1)
+            field_name = left.strip()
+            field_type = right.strip()
+            if not field_name:
+                field_name = f"f{index}"
+            if not field_type:
+                raise ValueError(f"decode type missing for field '{field_name}'")
+            return field_name, field_type
+
+        return f"f{index}", text
+
+    def _resolve_decode_type(self, type_token: str) -> tuple[str, str]:
+        token = type_token.strip().lower().replace(" ", "").replace("-", "_")
+        if not token:
+            raise ValueError("empty decode type")
+
+        if token in DECODE_ALIAS_TO_BASE:
+            return DECODE_ALIAS_TO_BASE[token], "<"
+
+        for suffix, endian in (("_le", "<"), ("_be", ">")):
+            if token.endswith(suffix):
+                base_token = token[: -len(suffix)]
+                if base_token in DECODE_ALIAS_TO_BASE:
+                    return DECODE_ALIAS_TO_BASE[base_token], endian
+
+        for suffix, endian in (("le", "<"), ("be", ">")):
+            if token.endswith(suffix):
+                base_token = token[: -len(suffix)]
+                if base_token in DECODE_ALIAS_TO_BASE:
+                    return DECODE_ALIAS_TO_BASE[base_token], endian
+
+        raise ValueError(f"unsupported decode type '{type_token}'")
+
+    def _decode_payload(self, frame_id: int, payload: list[int], decode_spec: str | None = None) -> str:
+        if not payload:
+            return ""
+
+        spec = (decode_spec if decode_spec is not None else self.decode_specs_by_id.get(frame_id, "")).strip()
+        if not spec:
+            return ""
+
+        fields = [part.strip() for part in spec.split(",") if part.strip()]
+        if not fields:
+            return ""
+
+        offset = 0
+        parsed: list[str] = []
+
+        for index, field_text in enumerate(fields, start=1):
+            field_name, field_type = self._split_decode_field(field_text, index)
+            base_type, endian = self._resolve_decode_type(field_type)
+
+            if base_type == "bool":
+                if offset + 1 > len(payload):
+                    raise ValueError(f"{field_name} expects 1 byte")
+                value = payload[offset] != 0
+                offset += 1
+                parsed.append(f"{field_name}={'true' if value else 'false'}")
+                continue
+
+            type_info = DECODE_BASE_INFO.get(base_type)
+            if type_info is None:
+                raise ValueError(f"unsupported decode base '{base_type}'")
+
+            fmt_char, size = type_info
+            if offset + size > len(payload):
+                raise ValueError(f"{field_name} expects {size} bytes")
+
+            raw = bytes(payload[offset : offset + size])
+            value = struct.unpack(endian + fmt_char, raw)[0]
+            offset += size
+
+            if isinstance(value, float):
+                parsed.append(f"{field_name}={value:.6g}")
+            else:
+                parsed.append(f"{field_name}={value}")
+
+        if offset < len(payload):
+            tail = " ".join(f"{byte:02X}" for byte in payload[offset:])
+            parsed.append(f"raw_tail={tail}")
+
+        return ", ".join(parsed)
+
+    def _refresh_decode_specs_by_id(self) -> None:
+        specs: dict[int, str] = {}
+        for msg in self.templates_by_item.values():
+            decode_spec = msg.decode_spec.strip()
+            if decode_spec:
+                specs[msg.frame_id] = decode_spec
+        self.decode_specs_by_id = specs
+
+        for can_id, entry in self.grouped_packets_by_id.items():
+            payload = entry.get("last_payload")
+            if isinstance(payload, list):
+                try:
+                    entry["decoded"] = self._decode_payload(can_id, payload)
+                except Exception as exc:
+                    entry["decoded"] = f"decode-error: {exc}"
+            self._upsert_grouped_row(can_id, entry)
+
+    def _grouped_row_values(self, can_id: int, entry: dict[str, object]) -> tuple[str, ...]:
+        return (
+            f"0x{can_id:X}",
+            str(entry.get("format", "")),
+            str(entry.get("type", "")),
+            str(entry.get("tx_count", 0)),
+            str(entry.get("rx_count", 0)),
+            str(entry.get("last_dir", "")),
+            str(entry.get("last_if", "")),
+            str(entry.get("dlc", "")),
+            str(entry.get("raw", "")),
+            str(entry.get("decoded", "")),
+            str(entry.get("last_seen", "")),
+        )
+
+    def _upsert_grouped_row(self, can_id: int, entry: dict[str, object]) -> None:
+        values = self._grouped_row_values(can_id, entry)
+        existing = self.group_tree_items.get(can_id)
+
+        if existing and self.group_tree.exists(existing):
+            self.group_tree.item(existing, values=values)
+            return
+
+        item = self.group_tree.insert("", tk.END, values=values)
+        self.group_tree_items[can_id] = item
+
+    def _record_grouped_packet(
+        self,
+        direction: str,
+        channel: int,
+        frame_id: int,
+        extended: bool,
+        remote: bool,
+        dlc: int,
+        payload: list[int],
+        decode_spec: str | None = None,
+    ) -> None:
+        if decode_spec and decode_spec.strip():
+            self.decode_specs_by_id[frame_id] = decode_spec.strip()
+
+        entry = self.grouped_packets_by_id.get(frame_id)
+        if entry is None:
+            entry = {
+                "format": "EXT" if extended else "STD",
+                "type": "RTR" if remote else "DATA",
+                "tx_count": 0,
+                "rx_count": 0,
+                "last_dir": "",
+                "last_if": "",
+                "dlc": 0,
+                "raw": "",
+                "decoded": "",
+                "last_seen": "",
+                "last_payload": [],
+            }
+            self.grouped_packets_by_id[frame_id] = entry
+
+        if direction == "TX":
+            entry["tx_count"] = int(entry.get("tx_count", 0)) + 1
+        else:
+            entry["rx_count"] = int(entry.get("rx_count", 0)) + 1
+
+        raw_text = " ".join(f"{byte:02X}" for byte in payload)
+        decoded = ""
+        try:
+            decoded = self._decode_payload(frame_id, payload, decode_spec=decode_spec)
+        except Exception as exc:
+            decoded = f"decode-error: {exc}"
+
+        entry["format"] = "EXT" if extended else "STD"
+        entry["type"] = "RTR" if remote else "DATA"
+        entry["last_dir"] = direction
+        entry["last_if"] = f"CAN{channel + 1}"
+        entry["dlc"] = dlc
+        entry["raw"] = raw_text
+        entry["decoded"] = decoded
+        entry["last_seen"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        entry["last_payload"] = list(payload)
+
+        self._upsert_grouped_row(frame_id, entry)
+
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
 
@@ -655,6 +1000,7 @@ class CanGuiApp(tk.Tk):
         frame_id = self._parse_can_id(self.id_var.get().strip(), bool(self.extended_var.get()))
         extended = bool(self.extended_var.get())
         remote = bool(self.remote_var.get())
+        decode_spec = self.decode_var.get().strip()
         period_ms = int(self.period_ms_var.get())
 
         if period_ms < 0:
@@ -678,6 +1024,7 @@ class CanGuiApp(tk.Tk):
             remote=remote,
             dlc=dlc,
             data=data,
+            decode_spec=decode_spec,
             period_ms=period_ms,
         )
 
@@ -732,6 +1079,7 @@ class CanGuiApp(tk.Tk):
             "RTR" if msg.remote else "DATA",
             str(msg.dlc),
             str(msg.period_ms),
+            msg.decode_spec,
             " ".join(f"{b:02X}" for b in msg.data),
         )
 
@@ -747,11 +1095,13 @@ class CanGuiApp(tk.Tk):
             item = selected[0]
             self.templates_by_item[item] = msg
             self.template_tree.item(item, values=self._template_values(msg))
+            self._refresh_decode_specs_by_id()
             self._set_status(f"Updated template '{msg.name}'")
             return
 
         item = self.template_tree.insert("", tk.END, values=self._template_values(msg))
         self.templates_by_item[item] = msg
+        self._refresh_decode_specs_by_id()
         self._set_status(f"Saved template '{msg.name}'")
 
     def delete_template(self) -> None:
@@ -763,6 +1113,7 @@ class CanGuiApp(tk.Tk):
             self.template_tree.delete(item)
             self.templates_by_item.pop(item, None)
 
+        self._refresh_decode_specs_by_id()
         self._set_status("Deleted selected template(s)")
 
     def _on_template_selected(self, _event: object) -> None:
@@ -781,6 +1132,7 @@ class CanGuiApp(tk.Tk):
         self.extended_var.set(1 if msg.extended else 0)
         self.remote_var.set(1 if msg.remote else 0)
         self.dlc_var.set(msg.dlc)
+        self.decode_var.set(msg.decode_spec)
         self.period_ms_var.set(msg.period_ms)
         self.data_var.set(" ".join(f"{byte:02X}" for byte in msg.data))
         self._on_remote_toggle()
@@ -813,6 +1165,23 @@ class CanGuiApp(tk.Tk):
 
         if sent != 1:
             raise RuntimeError(f"VCI_Transmit failed on CAN{msg.channel + 1}")
+
+        payload_for_group = list(msg.data[: msg.dlc]) if not msg.remote else []
+        self.ui_event_queue.put(
+            (
+                "group_event",
+                {
+                    "direction": "TX",
+                    "channel": msg.channel,
+                    "frame_id": msg.frame_id,
+                    "extended": msg.extended,
+                    "remote": msg.remote,
+                    "dlc": msg.dlc,
+                    "payload": payload_for_group,
+                    "decode_spec": msg.decode_spec,
+                },
+            )
+        )
 
     def _send_message(self, msg: MessageTemplate) -> None:
         self._transmit_message(msg)
@@ -1081,6 +1450,7 @@ class CanGuiApp(tk.Tk):
                     "type",
                     "dlc",
                     "data",
+                    "decoded",
                     "timestamp_hex",
                     "timestamp_dec",
                 ]
@@ -1097,12 +1467,20 @@ class CanGuiApp(tk.Tk):
                         record["type"],
                         record["dlc"],
                         record["data"],
+                        record.get("decoded", ""),
                         record["timestamp_hex"],
                         record["timestamp_dec"],
                     ]
                 )
 
         self._set_status(f"Exported {len(records)} {channel_name} packet(s) to CSV")
+
+    def clear_grouped_view(self) -> None:
+        self.grouped_packets_by_id.clear()
+        self.group_tree_items.clear()
+        for item in self.group_tree.get_children():
+            self.group_tree.delete(item)
+        self._set_status("Cleared grouped-by-ID view")
 
     def clear_can1_log(self) -> None:
         self._clear_text(self.rx_text_can1)
