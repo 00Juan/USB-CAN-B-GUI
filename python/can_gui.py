@@ -152,16 +152,19 @@ class CanGuiApp(tk.Tk):
         self.custom_decode_fields_by_id: dict[int, list[dict[str, str]]] = {}
         self.custom_decode_specs_by_id: dict[int, str] = {}
         self.decode_specs_by_id: dict[int, str] = {}
-        self.grouped_packets_by_id: dict[int, dict[str, object]] = {}
-        self.group_tree_items: dict[int, str] = {}
-        self.decoded_group_tree_items: dict[int, str] = {}
+        self.grouped_packets_by_id: dict[tuple[int, int], dict[str, object]] = {}
+        self.group_tree_items: dict[tuple[int, int], str] = {}
+        self.decoded_group_tree_items: dict[tuple[int, int], str] = {}
         self.decode_rule_tree_items: dict[int, str] = {}
         self.rx_records_can1: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
         self.rx_records_can2: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
 
         self.lib_path_var = tk.StringVar(value=self._default_lib_path())
-        self.baud_var = tk.StringVar(value="125K")
+        self.can1_baud_var = tk.StringVar(value="125K")
+        self.can2_baud_var = tk.StringVar(value="125K")
         self.status_var = tk.StringVar(value="Disconnected")
+        self.group_if_filter_var = tk.StringVar(value="All")
+        self.group_dir_filter_var = tk.StringVar(value="All")
 
         self.name_var = tk.StringVar(value="Frame1")
         self.channel_var = tk.StringVar(value="CAN1")
@@ -248,23 +251,32 @@ class CanGuiApp(tk.Tk):
         lib_entry = ttk.Entry(frame, textvariable=self.lib_path_var)
         lib_entry.grid(row=0, column=1, sticky=tk.EW, padx=6)
 
-        ttk.Label(frame, text="Baud:").grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(frame, text="CAN1 baud:").grid(row=0, column=2, sticky=tk.W)
         ttk.Combobox(
             frame,
-            textvariable=self.baud_var,
+            textvariable=self.can1_baud_var,
             values=list(BAUD_TO_TIMING.keys()),
             state="readonly",
             width=8,
         ).grid(row=0, column=3, sticky=tk.W, padx=(6, 12))
 
+        ttk.Label(frame, text="CAN2 baud:").grid(row=0, column=4, sticky=tk.W)
+        ttk.Combobox(
+            frame,
+            textvariable=self.can2_baud_var,
+            values=list(BAUD_TO_TIMING.keys()),
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=5, sticky=tk.W, padx=(6, 12))
+
         self.connect_btn = ttk.Button(frame, text="Connect", command=self.connect_device)
-        self.connect_btn.grid(row=0, column=4, sticky=tk.EW)
+        self.connect_btn.grid(row=0, column=6, sticky=tk.EW)
 
         self.disconnect_btn = ttk.Button(frame, text="Disconnect", command=self.disconnect_device)
-        self.disconnect_btn.grid(row=0, column=5, sticky=tk.EW, padx=(6, 0))
+        self.disconnect_btn.grid(row=0, column=7, sticky=tk.EW, padx=(6, 0))
 
         self.self_test_btn = ttk.Button(frame, text="Self Test", command=self.run_self_test)
-        self.self_test_btn.grid(row=0, column=6, sticky=tk.EW, padx=(6, 0))
+        self.self_test_btn.grid(row=0, column=8, sticky=tk.EW, padx=(6, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -398,6 +410,33 @@ class CanGuiApp(tk.Tk):
         ttk.Button(row, text="Clear Grouped", command=self.clear_grouped_view).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row, text="Configure Decode Rules", command=self.open_decode_rule_window).pack(side=tk.LEFT, padx=(6, 0))
 
+        filter_row = ttk.Frame(outer)
+        filter_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(filter_row, text="Grouped Filters:").pack(side=tk.LEFT)
+        ttk.Label(filter_row, text="Interface").pack(side=tk.LEFT, padx=(8, 4))
+        interface_filter = ttk.Combobox(
+            filter_row,
+            textvariable=self.group_if_filter_var,
+            values=["All", "CAN1", "CAN2"],
+            state="readonly",
+            width=6,
+        )
+        interface_filter.pack(side=tk.LEFT)
+        interface_filter.bind("<<ComboboxSelected>>", self._on_group_filter_changed)
+
+        ttk.Label(filter_row, text="Direction").pack(side=tk.LEFT, padx=(10, 4))
+        direction_filter = ttk.Combobox(
+            filter_row,
+            textvariable=self.group_dir_filter_var,
+            values=["All", "RX", "TX"],
+            state="readonly",
+            width=5,
+        )
+        direction_filter.pack(side=tk.LEFT)
+        direction_filter.bind("<<ComboboxSelected>>", self._on_group_filter_changed)
+
+        ttk.Button(filter_row, text="Reset Filters", command=self.reset_group_filters).pack(side=tk.LEFT, padx=(10, 0))
+
         notebook = ttk.Notebook(outer)
         notebook.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
@@ -408,38 +447,38 @@ class CanGuiApp(tk.Tk):
 
         raw_columns = (
             "id",
+            "last_if",
             "format",
             "type",
             "tx_count",
             "rx_count",
             "last_dir",
-            "last_if",
             "dlc",
             "raw",
             "last_seen",
         )
         raw_headings = {
             "id": "CAN ID",
+            "last_if": "Interface",
             "format": "Format",
             "type": "Type",
             "tx_count": "TX",
             "rx_count": "RX",
             "last_dir": "Last Dir",
-            "last_if": "Last IF",
             "dlc": "DLC",
             "raw": "Last Raw Data",
             "last_seen": "Last Seen",
         }
         raw_widths = {
             "id": 90,
+            "last_if": 85,
             "format": 70,
             "type": 70,
             "tx_count": 55,
             "rx_count": 55,
             "last_dir": 70,
-            "last_if": 70,
             "dlc": 50,
-            "raw": 360,
+            "raw": 300,
             "last_seen": 115,
         }
 
@@ -458,38 +497,38 @@ class CanGuiApp(tk.Tk):
 
         decoded_columns = (
             "id",
+            "last_if",
             "format",
             "type",
             "tx_count",
             "rx_count",
             "last_dir",
-            "last_if",
             "dlc",
             "decoded",
             "last_seen",
         )
         decoded_headings = {
             "id": "CAN ID",
+            "last_if": "Interface",
             "format": "Format",
             "type": "Type",
             "tx_count": "TX",
             "rx_count": "RX",
             "last_dir": "Last Dir",
-            "last_if": "Last IF",
             "dlc": "DLC",
             "decoded": "Decoded Data",
             "last_seen": "Last Seen",
         }
         decoded_widths = {
             "id": 90,
+            "last_if": 85,
             "format": 70,
             "type": 70,
             "tx_count": 55,
             "rx_count": 55,
             "last_dir": 70,
-            "last_if": 70,
             "dlc": 50,
-            "decoded": 430,
+            "decoded": 360,
             "last_seen": 115,
         }
 
@@ -700,23 +739,26 @@ class CanGuiApp(tk.Tk):
 
         try:
             self.dll = self._load_library()
-            timing0, timing1 = BAUD_TO_TIMING[self.baud_var.get()]
-
-            cfg = VCI_INIT_CONFIG(
-                AccCode=0x80000008,
-                AccMask=0xFFFFFFFF,
-                Reserved=0,
-                Filter=0,
-                Timing0=timing0,
-                Timing1=timing1,
-                Mode=0,
-            )
+            channel_baud = {
+                0: self.can1_baud_var.get(),
+                1: self.can2_baud_var.get(),
+            }
 
             with self.api_lock:
                 if self.dll.VCI_OpenDevice(VCI_USBCAN2, 0, 0) != STATUS_OK:
                     raise RuntimeError("VCI_OpenDevice failed")
 
                 for channel in (0, 1):
+                    timing0, timing1 = BAUD_TO_TIMING[channel_baud[channel]]
+                    cfg = VCI_INIT_CONFIG(
+                        AccCode=0x80000008,
+                        AccMask=0xFFFFFFFF,
+                        Reserved=0,
+                        Filter=0,
+                        Timing0=timing0,
+                        Timing1=timing1,
+                        Mode=0,
+                    )
                     if self.dll.VCI_InitCAN(VCI_USBCAN2, 0, channel, ctypes.byref(cfg)) != STATUS_OK:
                         raise RuntimeError(f"VCI_InitCAN failed for CAN{channel + 1}")
                     if self.dll.VCI_StartCAN(VCI_USBCAN2, 0, channel) != STATUS_OK:
@@ -728,7 +770,9 @@ class CanGuiApp(tk.Tk):
 
             self.connected = True
             self._set_connected_ui(True)
-            self._set_status(f"Connected ({self.baud_var.get()})")
+            self._set_status(
+                f"Connected (CAN1={self.can1_baud_var.get()}, CAN2={self.can2_baud_var.get()})"
+            )
         except Exception as exc:
             self._set_status("Connect failed")
             self._safe_close_device()
@@ -1554,61 +1598,107 @@ class CanGuiApp(tk.Tk):
     def _refresh_decode_specs_by_id(self) -> None:
         self.decode_specs_by_id = dict(self.custom_decode_specs_by_id)
 
-        for can_id, entry in self.grouped_packets_by_id.items():
+        for group_key, entry in self.grouped_packets_by_id.items():
+            can_id = group_key[1]
             payload = entry.get("last_payload")
             if isinstance(payload, list):
                 try:
                     entry["decoded"] = self._decode_payload(can_id, payload)
                 except Exception as exc:
                     entry["decoded"] = f"decode-error: {exc}"
-            self._upsert_grouped_row(can_id, entry)
+            self._upsert_grouped_row(group_key, entry)
 
-    def _grouped_raw_row_values(self, can_id: int, entry: dict[str, object]) -> tuple[str, ...]:
+    def _group_entry_matches_filters(self, group_key: tuple[int, int], entry: dict[str, object]) -> bool:
+        channel, _ = group_key
+
+        interface_filter = self.group_if_filter_var.get().strip().upper()
+        if interface_filter == "CAN1" and channel != 0:
+            return False
+        if interface_filter == "CAN2" and channel != 1:
+            return False
+
+        direction_filter = self.group_dir_filter_var.get().strip().upper()
+        tx_count = int(entry.get("tx_count", 0))
+        rx_count = int(entry.get("rx_count", 0))
+
+        if direction_filter == "RX" and rx_count <= 0:
+            return False
+        if direction_filter == "TX" and tx_count <= 0:
+            return False
+
+        return True
+
+    def _on_group_filter_changed(self, _event: object) -> None:
+        self._refresh_grouped_rows_by_filters()
+
+    def reset_group_filters(self) -> None:
+        self.group_if_filter_var.set("All")
+        self.group_dir_filter_var.set("All")
+        self._refresh_grouped_rows_by_filters()
+
+    def _refresh_grouped_rows_by_filters(self) -> None:
+        for group_key, entry in self.grouped_packets_by_id.items():
+            self._upsert_grouped_row(group_key, entry)
+
+    def _grouped_raw_row_values(self, group_key: tuple[int, int], entry: dict[str, object]) -> tuple[str, ...]:
+        channel, can_id = group_key
         return (
             f"0x{can_id:X}",
+            str(entry.get("last_if", f"CAN{channel + 1}")),
             str(entry.get("format", "")),
             str(entry.get("type", "")),
             str(entry.get("tx_count", 0)),
             str(entry.get("rx_count", 0)),
             str(entry.get("last_dir", "")),
-            str(entry.get("last_if", "")),
             str(entry.get("dlc", "")),
             str(entry.get("raw", "")),
             str(entry.get("last_seen", "")),
         )
 
-    def _grouped_decoded_row_values(self, can_id: int, entry: dict[str, object]) -> tuple[str, ...]:
+    def _grouped_decoded_row_values(self, group_key: tuple[int, int], entry: dict[str, object]) -> tuple[str, ...]:
+        channel, can_id = group_key
         return (
             f"0x{can_id:X}",
+            str(entry.get("last_if", f"CAN{channel + 1}")),
             str(entry.get("format", "")),
             str(entry.get("type", "")),
             str(entry.get("tx_count", 0)),
             str(entry.get("rx_count", 0)),
             str(entry.get("last_dir", "")),
-            str(entry.get("last_if", "")),
             str(entry.get("dlc", "")),
             str(entry.get("decoded", "")),
             str(entry.get("last_seen", "")),
         )
 
-    def _upsert_grouped_row(self, can_id: int, entry: dict[str, object]) -> None:
-        raw_values = self._grouped_raw_row_values(can_id, entry)
-        raw_existing = self.group_tree_items.get(can_id)
+    def _upsert_grouped_row(self, group_key: tuple[int, int], entry: dict[str, object]) -> None:
+        raw_existing = self.group_tree_items.get(group_key)
+        decoded_existing = self.decoded_group_tree_items.get(group_key)
+
+        if not self._group_entry_matches_filters(group_key, entry):
+            if raw_existing and self.group_tree.exists(raw_existing):
+                self.group_tree.delete(raw_existing)
+            self.group_tree_items.pop(group_key, None)
+
+            if decoded_existing and self.decoded_group_tree.exists(decoded_existing):
+                self.decoded_group_tree.delete(decoded_existing)
+            self.decoded_group_tree_items.pop(group_key, None)
+            return
+
+        raw_values = self._grouped_raw_row_values(group_key, entry)
 
         if raw_existing and self.group_tree.exists(raw_existing):
             self.group_tree.item(raw_existing, values=raw_values)
         else:
             raw_item = self.group_tree.insert("", tk.END, values=raw_values)
-            self.group_tree_items[can_id] = raw_item
+            self.group_tree_items[group_key] = raw_item
 
-        decoded_values = self._grouped_decoded_row_values(can_id, entry)
-        decoded_existing = self.decoded_group_tree_items.get(can_id)
+        decoded_values = self._grouped_decoded_row_values(group_key, entry)
 
         if decoded_existing and self.decoded_group_tree.exists(decoded_existing):
             self.decoded_group_tree.item(decoded_existing, values=decoded_values)
         else:
             decoded_item = self.decoded_group_tree.insert("", tk.END, values=decoded_values)
-            self.decoded_group_tree_items[can_id] = decoded_item
+            self.decoded_group_tree_items[group_key] = decoded_item
 
     def _record_grouped_packet(
         self,
@@ -1626,7 +1716,8 @@ class CanGuiApp(tk.Tk):
             active_decode_spec = decode_spec.strip()
             self.decode_specs_by_id[frame_id] = active_decode_spec
 
-        entry = self.grouped_packets_by_id.get(frame_id)
+        group_key = (channel, frame_id)
+        entry = self.grouped_packets_by_id.get(group_key)
         if entry is None:
             entry = {
                 "format": "EXT" if extended else "STD",
@@ -1634,14 +1725,14 @@ class CanGuiApp(tk.Tk):
                 "tx_count": 0,
                 "rx_count": 0,
                 "last_dir": "",
-                "last_if": "",
+                "last_if": f"CAN{channel + 1}",
                 "dlc": 0,
                 "raw": "",
                 "decoded": "",
                 "last_seen": "",
                 "last_payload": [],
             }
-            self.grouped_packets_by_id[frame_id] = entry
+            self.grouped_packets_by_id[group_key] = entry
 
         if direction == "TX":
             entry["tx_count"] = int(entry.get("tx_count", 0)) + 1
@@ -1665,7 +1756,7 @@ class CanGuiApp(tk.Tk):
         entry["last_seen"] = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         entry["last_payload"] = list(payload)
 
-        self._upsert_grouped_row(frame_id, entry)
+        self._upsert_grouped_row(group_key, entry)
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
