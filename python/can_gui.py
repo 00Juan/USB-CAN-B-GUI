@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import ctypes
+import json
 import queue
 import struct
 import threading
@@ -155,6 +156,8 @@ class CanGuiApp(tk.Tk):
         self.grouped_packets_by_id: dict[tuple[int, int], dict[str, object]] = {}
         self.group_tree_items: dict[tuple[int, int], str] = {}
         self.decoded_group_tree_items: dict[tuple[int, int], str] = {}
+        self.database_tree_items: dict[tuple[int, int, str], str] = {}
+        self.database_row_keys_by_group: dict[tuple[int, int], set[tuple[int, int, str]]] = {}
         self.decode_rule_tree_items: dict[int, str] = {}
         self.rx_records_can1: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
         self.rx_records_can2: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
@@ -184,8 +187,10 @@ class CanGuiApp(tk.Tk):
         self.rule_window: tk.Toplevel | None = None
         self.rule_fields_tree = None
         self.decode_rule_tree = None
+        self.session_state_path = Path(__file__).resolve().parent / "can_gui_session.json"
 
         self._build_ui()
+        self._load_session_state()
         self._set_connected_ui(False)
         self._on_remote_toggle()
         self.after(50, self._process_rx_queue)
@@ -225,6 +230,306 @@ class CanGuiApp(tk.Tk):
             deduped.append(candidate)
 
         return deduped
+
+    def _template_to_state_dict(self, msg: MessageTemplate) -> dict[str, object]:
+        return {
+            "name": msg.name,
+            "channel": int(msg.channel),
+            "frame_id": int(msg.frame_id),
+            "extended": bool(msg.extended),
+            "remote": bool(msg.remote),
+            "dlc": int(msg.dlc),
+            "data": [int(byte) & 0xFF for byte in msg.data],
+            "period_ms": int(msg.period_ms),
+        }
+
+    def _template_from_state_dict(self, raw: object) -> MessageTemplate | None:
+        if not isinstance(raw, dict):
+            return None
+
+        try:
+            name = str(raw.get("name", "")).strip() or "Unnamed"
+            channel = int(raw.get("channel", 0))
+            frame_id = int(raw.get("frame_id", 0))
+            extended = bool(raw.get("extended", False))
+            remote = bool(raw.get("remote", False))
+            dlc = int(raw.get("dlc", 0))
+            period_ms = int(raw.get("period_ms", 0))
+        except Exception:
+            return None
+
+        if channel not in (0, 1):
+            return None
+        if frame_id < 0 or frame_id > 0x1FFFFFFF:
+            return None
+        if dlc < 0 or dlc > MAX_CAN_DATA_LEN:
+            return None
+        if period_ms < 0:
+            period_ms = 0
+
+        raw_data = raw.get("data", [])
+        data: list[int] = []
+        if isinstance(raw_data, list):
+            for token in raw_data[:MAX_CAN_DATA_LEN]:
+                try:
+                    value = int(token)
+                except Exception:
+                    continue
+                if 0 <= value <= 0xFF:
+                    data.append(value)
+
+        if remote:
+            data = []
+        if not remote:
+            data = data[:dlc]
+            if len(data) < dlc:
+                data.extend([0] * (dlc - len(data)))
+
+        return MessageTemplate(
+            name=name,
+            channel=channel,
+            frame_id=frame_id,
+            extended=extended,
+            remote=remote,
+            dlc=dlc,
+            data=data,
+            period_ms=period_ms,
+        )
+
+    def _normalize_grouped_entry(self, channel: int, entry: object) -> dict[str, object] | None:
+        if not isinstance(entry, dict):
+            return None
+
+        try:
+            tx_count = max(0, int(entry.get("tx_count", 0)))
+            rx_count = max(0, int(entry.get("rx_count", 0)))
+            dlc = int(entry.get("dlc", 0))
+        except Exception:
+            return None
+
+        if dlc < 0:
+            dlc = 0
+        if dlc > MAX_CAN_DATA_LEN:
+            dlc = MAX_CAN_DATA_LEN
+
+        payload: list[int] = []
+        raw_payload = entry.get("last_payload", [])
+        if isinstance(raw_payload, list):
+            for token in raw_payload[:MAX_CAN_DATA_LEN]:
+                try:
+                    value = int(token)
+                except Exception:
+                    continue
+                if 0 <= value <= 0xFF:
+                    payload.append(value)
+
+        normalized = {
+            "format": str(entry.get("format", "STD")),
+            "type": str(entry.get("type", "DATA")),
+            "tx_count": tx_count,
+            "rx_count": rx_count,
+            "last_dir": str(entry.get("last_dir", "")),
+            "last_if": str(entry.get("last_if", f"CAN{channel + 1}")),
+            "dlc": dlc,
+            "raw": str(entry.get("raw", "")),
+            "decoded": str(entry.get("decoded", "")),
+            "last_seen": str(entry.get("last_seen", "")),
+            "last_payload": payload,
+        }
+        return normalized
+
+    def _save_session_state(self) -> None:
+        try:
+            templates_state: list[dict[str, object]] = []
+            for item in self.template_tree.get_children():
+                msg = self.templates_by_item.get(item)
+                if not msg:
+                    continue
+                templates_state.append(self._template_to_state_dict(msg))
+
+            grouped_state: list[dict[str, object]] = []
+            sorted_groups = sorted(self.grouped_packets_by_id.items(), key=lambda entry: (entry[0][0], entry[0][1]))
+            for (channel, frame_id), entry in sorted_groups:
+                normalized_entry = self._normalize_grouped_entry(channel, entry)
+                if normalized_entry is None:
+                    continue
+                grouped_state.append(
+                    {
+                        "channel": channel,
+                        "frame_id": frame_id,
+                        "entry": normalized_entry,
+                    }
+                )
+
+            fields_state: dict[str, list[dict[str, str]]] = {}
+            for can_id, field_defs in self.custom_decode_fields_by_id.items():
+                normalized_fields: list[dict[str, str]] = []
+                for field in field_defs:
+                    if not isinstance(field, dict):
+                        continue
+                    field_name = str(field.get("name", "")).strip()
+                    field_start = str(field.get("start", "0")).strip() or "0"
+                    field_type = str(field.get("type", "")).strip().lower()
+                    field_endian = str(field.get("endian", "LE")).strip().upper() or "LE"
+                    if not field_name or field_type not in RULE_TYPE_OPTIONS:
+                        continue
+                    if field_endian not in RULE_ENDIAN_OPTIONS:
+                        field_endian = "LE"
+                    normalized_fields.append(
+                        {
+                            "name": field_name,
+                            "start": field_start,
+                            "type": field_type,
+                            "endian": field_endian,
+                        }
+                    )
+                if normalized_fields:
+                    fields_state[str(can_id)] = normalized_fields
+
+            state = {
+                "version": 1,
+                "can1_baud": self.can1_baud_var.get(),
+                "can2_baud": self.can2_baud_var.get(),
+                "group_if_filter": self.group_if_filter_var.get(),
+                "group_dir_filter": self.group_dir_filter_var.get(),
+                "templates": templates_state,
+                "custom_decode_specs_by_id": {str(can_id): spec for can_id, spec in self.custom_decode_specs_by_id.items()},
+                "custom_decode_fields_by_id": fields_state,
+                "grouped_packets": grouped_state,
+            }
+
+            temp_path = self.session_state_path.with_suffix(self.session_state_path.suffix + ".tmp")
+            with temp_path.open("w", encoding="utf-8") as state_file:
+                json.dump(state, state_file, indent=2)
+            temp_path.replace(self.session_state_path)
+        except Exception as exc:
+            self._set_status(f"State save warning: {exc}")
+
+    def _load_session_state(self) -> None:
+        if not self.session_state_path.exists():
+            return
+
+        try:
+            with self.session_state_path.open("r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+        except Exception as exc:
+            self._set_status(f"State load warning: {exc}")
+            return
+
+        if not isinstance(state, dict):
+            return
+
+        can1_baud = str(state.get("can1_baud", "")).strip().upper()
+        can2_baud = str(state.get("can2_baud", "")).strip().upper()
+        if can1_baud in BAUD_TO_TIMING:
+            self.can1_baud_var.set(can1_baud)
+        if can2_baud in BAUD_TO_TIMING:
+            self.can2_baud_var.set(can2_baud)
+
+        if_filter = str(state.get("group_if_filter", "All")).strip().upper()
+        dir_filter = str(state.get("group_dir_filter", "All")).strip().upper()
+        self.group_if_filter_var.set({"ALL": "All", "CAN1": "CAN1", "CAN2": "CAN2"}.get(if_filter, "All"))
+        self.group_dir_filter_var.set({"ALL": "All", "RX": "RX", "TX": "TX"}.get(dir_filter, "All"))
+
+        for item in self.template_tree.get_children():
+            self.template_tree.delete(item)
+        self.templates_by_item.clear()
+
+        templates = state.get("templates", [])
+        if isinstance(templates, list):
+            for raw_template in templates:
+                msg = self._template_from_state_dict(raw_template)
+                if msg is None:
+                    continue
+                item = self.template_tree.insert("", tk.END, values=self._template_values(msg))
+                self.templates_by_item[item] = msg
+
+        self.custom_decode_specs_by_id.clear()
+        raw_specs = state.get("custom_decode_specs_by_id", {})
+        if isinstance(raw_specs, dict):
+            for raw_id, raw_spec in raw_specs.items():
+                try:
+                    can_id = int(str(raw_id), 0)
+                except Exception:
+                    continue
+                if can_id < 0 or can_id > 0x1FFFFFFF:
+                    continue
+                if isinstance(raw_spec, str):
+                    self.custom_decode_specs_by_id[can_id] = raw_spec
+
+        self.custom_decode_fields_by_id.clear()
+        raw_fields_map = state.get("custom_decode_fields_by_id", {})
+        if isinstance(raw_fields_map, dict):
+            for raw_id, raw_fields in raw_fields_map.items():
+                try:
+                    can_id = int(str(raw_id), 0)
+                except Exception:
+                    continue
+                if can_id < 0 or can_id > 0x1FFFFFFF:
+                    continue
+                if not isinstance(raw_fields, list):
+                    continue
+
+                parsed_fields: list[dict[str, str]] = []
+                for raw_field in raw_fields:
+                    if not isinstance(raw_field, dict):
+                        continue
+                    field_name = str(raw_field.get("name", "")).strip()
+                    field_start = str(raw_field.get("start", "0")).strip() or "0"
+                    field_type = str(raw_field.get("type", "")).strip().lower()
+                    field_endian = str(raw_field.get("endian", "LE")).strip().upper() or "LE"
+                    if not field_name or field_type not in RULE_TYPE_OPTIONS:
+                        continue
+                    if field_endian not in RULE_ENDIAN_OPTIONS:
+                        field_endian = "LE"
+                    parsed_fields.append(
+                        {
+                            "name": field_name,
+                            "start": field_start,
+                            "type": field_type,
+                            "endian": field_endian,
+                        }
+                    )
+
+                if parsed_fields:
+                    self.custom_decode_fields_by_id[can_id] = parsed_fields
+                    if can_id not in self.custom_decode_specs_by_id:
+                        self.custom_decode_specs_by_id[can_id] = self._field_defs_to_spec(parsed_fields)
+
+        self.grouped_packets_by_id.clear()
+        self.group_tree_items.clear()
+        self.decoded_group_tree_items.clear()
+        self.database_tree_items.clear()
+        self.database_row_keys_by_group.clear()
+        for item in self.group_tree.get_children():
+            self.group_tree.delete(item)
+        for item in self.decoded_group_tree.get_children():
+            self.decoded_group_tree.delete(item)
+        for item in self.database_tree.get_children():
+            self.database_tree.delete(item)
+
+        grouped_packets = state.get("grouped_packets", [])
+        if isinstance(grouped_packets, list):
+            for raw_packet in grouped_packets:
+                if not isinstance(raw_packet, dict):
+                    continue
+                try:
+                    channel = int(raw_packet.get("channel", 0))
+                    frame_id = int(raw_packet.get("frame_id", 0))
+                except Exception:
+                    continue
+                if channel not in (0, 1):
+                    continue
+                if frame_id < 0 or frame_id > 0x1FFFFFFF:
+                    continue
+
+                normalized_entry = self._normalize_grouped_entry(channel, raw_packet.get("entry", {}))
+                if normalized_entry is None:
+                    continue
+                self.grouped_packets_by_id[(channel, frame_id)] = normalized_entry
+
+        self._refresh_decode_specs_by_id()
+        self._refresh_grouped_rows_by_filters()
 
     def _build_ui(self) -> None:
         container = ttk.Frame(self, padding=10)
@@ -442,8 +747,10 @@ class CanGuiApp(tk.Tk):
 
         raw_group_tab = ttk.Frame(notebook)
         decoded_group_tab = ttk.Frame(notebook)
+        database_tab = ttk.Frame(notebook)
         notebook.add(raw_group_tab, text="Grouped by CAN ID")
         notebook.add(decoded_group_tab, text="Grouped by CAN ID (Decoded)")
+        notebook.add(database_tab, text="CAN Database")
 
         raw_columns = (
             "id",
@@ -538,6 +845,40 @@ class CanGuiApp(tk.Tk):
             self.decoded_group_tree.heading(key, text=decoded_headings[key])
             self.decoded_group_tree.column(key, width=decoded_widths[key], anchor=tk.W)
         self.decoded_group_tree.bind("<<TreeviewSelect>>", self._on_group_row_selected)
+
+        ttk.Label(
+            database_tab,
+            text="High-level message/signal view derived from grouped packets and decode rules.",
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 6))
+
+        db_columns = (
+            "signal",
+            "value",
+            "rx_count",
+            "tx_count",
+            "last_seen",
+        )
+        db_headings = {
+            "signal": "Signal",
+            "value": "Latest Value",
+            "rx_count": "RX",
+            "tx_count": "TX",
+            "last_seen": "Last Update",
+        }
+        db_widths = {
+            "signal": 220,
+            "value": 470,
+            "rx_count": 55,
+            "tx_count": 55,
+            "last_seen": 115,
+        }
+
+        self.database_tree = ttk.Treeview(database_tab, columns=db_columns, show="headings", height=14)
+        self.database_tree.pack(fill=tk.BOTH, expand=True)
+        for key in db_columns:
+            self.database_tree.heading(key, text=db_headings[key])
+            self.database_tree.column(key, width=db_widths[key], anchor=tk.W)
 
     def open_decode_rule_window(self) -> None:
         if self.rule_window is not None and self.rule_window.winfo_exists():
@@ -1568,6 +1909,7 @@ class CanGuiApp(tk.Tk):
         self._load_editor_field_defs(field_defs)
         self._upsert_decode_rule_row(can_id, field_defs)
         self._refresh_decode_specs_by_id()
+        self._save_session_state()
         self._set_status(f"Decoder rule set for ID 0x{can_id:X}")
 
     def delete_custom_decode_rule(self) -> None:
@@ -1593,6 +1935,7 @@ class CanGuiApp(tk.Tk):
         self.custom_decode_fields_by_id.pop(can_id, None)
         self._remove_decode_rule_row(can_id)
         self._refresh_decode_specs_by_id()
+        self._save_session_state()
         self._set_status(f"Decoder rule removed for ID 0x{can_id:X}")
 
     def _refresh_decode_specs_by_id(self) -> None:
@@ -1607,6 +1950,7 @@ class CanGuiApp(tk.Tk):
                 except Exception as exc:
                     entry["decoded"] = f"decode-error: {exc}"
             self._upsert_grouped_row(group_key, entry)
+            self._upsert_database_rows_for_group(group_key, entry)
 
     def _group_entry_matches_filters(self, group_key: tuple[int, int], entry: dict[str, object]) -> bool:
         channel, _ = group_key
@@ -1639,6 +1983,135 @@ class CanGuiApp(tk.Tk):
     def _refresh_grouped_rows_by_filters(self) -> None:
         for group_key, entry in self.grouped_packets_by_id.items():
             self._upsert_grouped_row(group_key, entry)
+
+        self._refresh_database_view()
+
+    def _message_label_for_group(self, channel: int, frame_id: int) -> str:
+        exact_matches: list[MessageTemplate] = []
+        id_matches: list[MessageTemplate] = []
+
+        for msg in self.templates_by_item.values():
+            if msg.frame_id == frame_id:
+                id_matches.append(msg)
+                if msg.channel == channel:
+                    exact_matches.append(msg)
+
+        if exact_matches:
+            return exact_matches[-1].name
+        if id_matches:
+            return id_matches[-1].name
+        return "-"
+
+    def _parse_decoded_pairs(self, decoded_text: str) -> dict[str, str]:
+        parsed: dict[str, str] = {}
+        for token in decoded_text.split(","):
+            part = token.strip()
+            if not part or "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            key = name.strip()
+            if not key:
+                continue
+            parsed[key] = value.strip()
+        return parsed
+
+    def _database_rows_for_group(
+        self,
+        group_key: tuple[int, int],
+        entry: dict[str, object],
+    ) -> list[tuple[tuple[int, int, str], tuple[str, ...]]]:
+        if not self._group_entry_matches_filters(group_key, entry):
+            return []
+
+        channel, frame_id = group_key
+        rx_count = str(entry.get("rx_count", 0))
+        tx_count = str(entry.get("tx_count", 0))
+        last_seen = str(entry.get("last_seen", ""))
+        decoded_text = str(entry.get("decoded", ""))
+        raw_text = str(entry.get("raw", ""))
+        decoded_pairs = self._parse_decoded_pairs(decoded_text)
+
+        rows: list[tuple[tuple[int, int, str], tuple[str, ...]]] = []
+        field_defs = self.custom_decode_fields_by_id.get(frame_id, [])
+        if field_defs:
+            for field in field_defs:
+                signal_name = str(field.get("name", "")).strip() or "field"
+                value_text = decoded_pairs.get(signal_name, "")
+                if not value_text:
+                    value_text = decoded_text if decoded_text.startswith("decode-error") else "-"
+
+                row_key = (channel, frame_id, signal_name)
+                row_values = (
+                    signal_name,
+                    value_text,
+                    rx_count,
+                    tx_count,
+                    last_seen,
+                )
+                rows.append((row_key, row_values))
+            return rows
+
+        if decoded_pairs:
+            for signal_name, value_text in decoded_pairs.items():
+                row_key = (channel, frame_id, signal_name)
+                row_values = (
+                    signal_name,
+                    value_text,
+                    rx_count,
+                    tx_count,
+                    last_seen,
+                )
+                rows.append((row_key, row_values))
+            return rows
+
+        fallback_value = decoded_text if decoded_text else (raw_text or "-")
+        fallback_signal = "frame"
+        row_key = (channel, frame_id, fallback_signal)
+        row_values = (
+            fallback_signal,
+            fallback_value,
+            rx_count,
+            tx_count,
+            last_seen,
+        )
+        rows.append((row_key, row_values))
+        return rows
+
+    def _delete_database_row(self, row_key: tuple[int, int, str]) -> None:
+        item = self.database_tree_items.pop(row_key, None)
+        if item and self.database_tree.exists(item):
+            self.database_tree.delete(item)
+
+    def _upsert_database_rows_for_group(self, group_key: tuple[int, int], entry: dict[str, object]) -> None:
+        rows = self._database_rows_for_group(group_key, entry)
+        new_keys = {row_key for row_key, _ in rows}
+        current_keys = self.database_row_keys_by_group.get(group_key, set())
+
+        for stale_key in current_keys - new_keys:
+            self._delete_database_row(stale_key)
+
+        for row_key, row_values in rows:
+            existing = self.database_tree_items.get(row_key)
+            if existing and self.database_tree.exists(existing):
+                self.database_tree.item(existing, values=row_values)
+            else:
+                item = self.database_tree.insert("", tk.END, values=row_values)
+                self.database_tree_items[row_key] = item
+
+        if new_keys:
+            self.database_row_keys_by_group[group_key] = new_keys
+        else:
+            self.database_row_keys_by_group.pop(group_key, None)
+
+    def _refresh_database_view(self) -> None:
+        for group_key in list(self.database_row_keys_by_group.keys()):
+            if group_key not in self.grouped_packets_by_id:
+                for row_key in self.database_row_keys_by_group[group_key]:
+                    self._delete_database_row(row_key)
+                self.database_row_keys_by_group.pop(group_key, None)
+
+        for group_key, entry in self.grouped_packets_by_id.items():
+            self._upsert_database_rows_for_group(group_key, entry)
 
     def _grouped_raw_row_values(self, group_key: tuple[int, int], entry: dict[str, object]) -> tuple[str, ...]:
         channel, can_id = group_key
@@ -1757,6 +2230,7 @@ class CanGuiApp(tk.Tk):
         entry["last_payload"] = list(payload)
 
         self._upsert_grouped_row(group_key, entry)
+        self._upsert_database_rows_for_group(group_key, entry)
 
     def _set_status(self, text: str) -> None:
         self.status_var.set(text)
@@ -1860,12 +2334,14 @@ class CanGuiApp(tk.Tk):
             self.templates_by_item[item] = msg
             self.template_tree.item(item, values=self._template_values(msg))
             self._refresh_decode_specs_by_id()
+            self._save_session_state()
             self._set_status(f"Updated template '{msg.name}'")
             return
 
         item = self.template_tree.insert("", tk.END, values=self._template_values(msg))
         self.templates_by_item[item] = msg
         self._refresh_decode_specs_by_id()
+        self._save_session_state()
         self._set_status(f"Saved template '{msg.name}'")
 
     def delete_template(self) -> None:
@@ -1878,6 +2354,7 @@ class CanGuiApp(tk.Tk):
             self.templates_by_item.pop(item, None)
 
         self._refresh_decode_specs_by_id()
+        self._save_session_state()
         self._set_status("Deleted selected template(s)")
 
     def _on_template_selected(self, _event: object) -> None:
@@ -2241,10 +2718,15 @@ class CanGuiApp(tk.Tk):
         self.grouped_packets_by_id.clear()
         self.group_tree_items.clear()
         self.decoded_group_tree_items.clear()
+        self.database_tree_items.clear()
+        self.database_row_keys_by_group.clear()
         for item in self.group_tree.get_children():
             self.group_tree.delete(item)
         for item in self.decoded_group_tree.get_children():
             self.decoded_group_tree.delete(item)
+        for item in self.database_tree.get_children():
+            self.database_tree.delete(item)
+        self._save_session_state()
         self._set_status("Cleared grouped-by-ID view")
 
     def clear_can1_log(self) -> None:
@@ -2256,6 +2738,11 @@ class CanGuiApp(tk.Tk):
         self._set_status("Cleared CAN2 RX log")
 
     def _on_close(self) -> None:
+        try:
+            self._save_session_state()
+        except Exception:
+            pass
+
         try:
             self.disconnect_device()
         finally:
