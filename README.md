@@ -1,6 +1,6 @@
 # USB-CAN-B Code 
 
-This repository contains CAN examples for a dual-channel USB-CAN adapter on Linux
+This repository contains CAN examples for a dual-channel USB-CAN adapter on Linux (USB-CAN-B adapter by Waveshare)
 
 It includes:
 
