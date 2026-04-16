@@ -9,11 +9,14 @@ It includes:
 - A Python Tkinter GUI for sending, receiving, decoding, and exporting CAN traffic.
 - C++ sample programs linked against `libcontrolcan.so`.
 
-## Source Attribution
+## Licensing and Third-Party Materials
 
-- The GUI application in `python/can_gui.py` is an original implementation developed by the repository author.
-- All other CAN-related files in this repository are official code/resources provided by Waveshare from their Linux documentation page:
-   https://www.waveshare.com/wiki/USB-CAN-B#Working_with_Linux
+- Original implementation by the repository author: `python/can_gui.py`.
+- Third-party code/resources: all remaining CAN-related files in this repository are based on official Waveshare materials.
+- Upstream source reference: [Waveshare USB-CAN-B Linux guide](https://www.waveshare.com/wiki/USB-CAN-B#Working_with_Linux).
+- Third-party copyrights and related rights remain with their respective owners.
+- Use and redistribution of Waveshare-provided files should follow Waveshare terms and permissions.
+- This project is an independent work and is not officially affiliated with or endorsed by Waveshare.
 
 ## Repository Layout
 
