@@ -35,6 +35,9 @@ It includes:
 
 ## Python GUI
 
+<img width="1206" height="802" alt="image" src="https://github.com/user-attachments/assets/f90b47ef-080a-4eb1-bc97-72b6a85d2e7e" />
+
+
 Main entry point:
 
 - `python/can_gui.py`
