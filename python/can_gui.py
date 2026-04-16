@@ -154,6 +154,7 @@ class CanGuiApp(tk.Tk):
         self.decode_specs_by_id: dict[int, str] = {}
         self.grouped_packets_by_id: dict[int, dict[str, object]] = {}
         self.group_tree_items: dict[int, str] = {}
+        self.decoded_group_tree_items: dict[int, str] = {}
         self.decode_rule_tree_items: dict[int, str] = {}
         self.rx_records_can1: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
         self.rx_records_can2: deque[dict[str, object]] = deque(maxlen=MAX_RX_HISTORY)
@@ -172,10 +173,14 @@ class CanGuiApp(tk.Tk):
         self.period_ms_var = tk.IntVar(value=0)
         self.rule_id_var = tk.StringVar(value="")
         self.rule_field_name_var = tk.StringVar(value="field1")
+        self.rule_field_start_var = tk.StringVar(value="0")
         self.rule_field_type_var = tk.StringVar(value="u8")
         self.rule_field_endian_var = tk.StringVar(value="LE")
 
         self.dll = None
+        self.rule_window: tk.Toplevel | None = None
+        self.rule_fields_tree = None
+        self.decode_rule_tree = None
 
         self._build_ui()
         self._set_connected_ui(False)
@@ -244,14 +249,13 @@ class CanGuiApp(tk.Tk):
         lib_entry.grid(row=0, column=1, sticky=tk.EW, padx=6)
 
         ttk.Label(frame, text="Baud:").grid(row=0, column=2, sticky=tk.W)
-        baud_combo = ttk.Combobox(
+        ttk.Combobox(
             frame,
             textvariable=self.baud_var,
             values=list(BAUD_TO_TIMING.keys()),
             state="readonly",
             width=8,
-        )
-        baud_combo.grid(row=0, column=3, sticky=tk.W, padx=(6, 12))
+        ).grid(row=0, column=3, sticky=tk.W, padx=(6, 12))
 
         self.connect_btn = ttk.Button(frame, text="Connect", command=self.connect_device)
         self.connect_btn.grid(row=0, column=4, sticky=tk.EW)
@@ -379,7 +383,6 @@ class CanGuiApp(tk.Tk):
             self.template_tree.column(key, width=widths[key], anchor=tk.W)
 
         self.template_tree.bind("<<TreeviewSelect>>", self._on_template_selected)
-
         form.columnconfigure(3, weight=1)
 
     def _build_rx_panel(self, parent: ttk.Frame) -> None:
@@ -393,29 +396,17 @@ class CanGuiApp(tk.Tk):
         ttk.Button(row, text="Export CAN1 CSV", command=lambda: self.export_rx_csv(0)).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row, text="Export CAN2 CSV", command=lambda: self.export_rx_csv(1)).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(row, text="Clear Grouped", command=self.clear_grouped_view).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(row, text="Configure Decode Rules", command=self.open_decode_rule_window).pack(side=tk.LEFT, padx=(6, 0))
 
         notebook = ttk.Notebook(outer)
         notebook.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
 
-        raw_tab = ttk.Frame(notebook)
-        grouped_tab = ttk.Frame(notebook)
-        notebook.add(raw_tab, text="Raw RX")
-        notebook.add(grouped_tab, text="Grouped by CAN ID")
+        raw_group_tab = ttk.Frame(notebook)
+        decoded_group_tab = ttk.Frame(notebook)
+        notebook.add(raw_group_tab, text="Grouped by CAN ID")
+        notebook.add(decoded_group_tab, text="Grouped by CAN ID (Decoded)")
 
-        logs = ttk.Frame(raw_tab)
-        logs.pack(fill=tk.BOTH, expand=True)
-
-        can1_frame = ttk.LabelFrame(logs, text="CAN1 RX")
-        can1_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
-        self.rx_text_can1 = tk.Text(can1_frame, height=14, wrap="none")
-        self.rx_text_can1.pack(fill=tk.BOTH, expand=True)
-
-        can2_frame = ttk.LabelFrame(logs, text="CAN2 RX")
-        can2_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
-        self.rx_text_can2 = tk.Text(can2_frame, height=14, wrap="none")
-        self.rx_text_can2.pack(fill=tk.BOTH, expand=True)
-
-        grouped_columns = (
+        raw_columns = (
             "id",
             "format",
             "type",
@@ -425,13 +416,9 @@ class CanGuiApp(tk.Tk):
             "last_if",
             "dlc",
             "raw",
-            "decoded",
             "last_seen",
         )
-        self.group_tree = ttk.Treeview(grouped_tab, columns=grouped_columns, show="headings", height=14)
-        self.group_tree.pack(fill=tk.BOTH, expand=True)
-
-        grouped_headings = {
+        raw_headings = {
             "id": "CAN ID",
             "format": "Format",
             "type": "Type",
@@ -441,10 +428,9 @@ class CanGuiApp(tk.Tk):
             "last_if": "Last IF",
             "dlc": "DLC",
             "raw": "Last Raw Data",
-            "decoded": "Decoded",
             "last_seen": "Last Seen",
         }
-        grouped_widths = {
+        raw_widths = {
             "id": 90,
             "format": 70,
             "type": 70,
@@ -453,125 +439,188 @@ class CanGuiApp(tk.Tk):
             "last_dir": 70,
             "last_if": 70,
             "dlc": 50,
-            "raw": 180,
-            "decoded": 320,
+            "raw": 360,
             "last_seen": 115,
         }
 
-        for key in grouped_columns:
-            self.group_tree.heading(key, text=grouped_headings[key])
-            self.group_tree.column(key, width=grouped_widths[key], anchor=tk.W)
-
+        self.group_tree = ttk.Treeview(raw_group_tab, columns=raw_columns, show="headings", height=14)
+        self.group_tree.pack(fill=tk.BOTH, expand=True)
+        for key in raw_columns:
+            self.group_tree.heading(key, text=raw_headings[key])
+            self.group_tree.column(key, width=raw_widths[key], anchor=tk.W)
         self.group_tree.bind("<<TreeviewSelect>>", self._on_group_row_selected)
 
-        rule_frame = ttk.LabelFrame(grouped_tab, text="Custom Decoder Rules (By CAN ID)")
-        rule_frame.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(
+            decoded_group_tab,
+            text="Decoded values are generated using rules from 'Configure Decode Rules'.",
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(0, 6))
 
-        rule_controls = ttk.Frame(rule_frame)
-        rule_controls.pack(fill=tk.X, padx=8, pady=(8, 6))
-
-        ttk.Label(rule_controls, text="CAN ID:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Entry(rule_controls, textvariable=self.rule_id_var, width=14).grid(row=0, column=1, sticky=tk.W, padx=(6, 12))
-        ttk.Label(rule_controls, text="Tip: selecting a grouped row auto-fills CAN ID").grid(
-            row=0,
-            column=2,
-            columnspan=4,
-            sticky=tk.W,
+        decoded_columns = (
+            "id",
+            "format",
+            "type",
+            "tx_count",
+            "rx_count",
+            "last_dir",
+            "last_if",
+            "dlc",
+            "decoded",
+            "last_seen",
         )
+        decoded_headings = {
+            "id": "CAN ID",
+            "format": "Format",
+            "type": "Type",
+            "tx_count": "TX",
+            "rx_count": "RX",
+            "last_dir": "Last Dir",
+            "last_if": "Last IF",
+            "dlc": "DLC",
+            "decoded": "Decoded Data",
+            "last_seen": "Last Seen",
+        }
+        decoded_widths = {
+            "id": 90,
+            "format": 70,
+            "type": 70,
+            "tx_count": 55,
+            "rx_count": 55,
+            "last_dir": 70,
+            "last_if": 70,
+            "dlc": 50,
+            "decoded": 430,
+            "last_seen": 115,
+        }
 
-        ttk.Label(rule_controls, text="Field name:").grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
-        ttk.Entry(rule_controls, textvariable=self.rule_field_name_var, width=16).grid(
-            row=1,
-            column=1,
+        self.decoded_group_tree = ttk.Treeview(decoded_group_tab, columns=decoded_columns, show="headings", height=14)
+        self.decoded_group_tree.pack(fill=tk.BOTH, expand=True)
+        for key in decoded_columns:
+            self.decoded_group_tree.heading(key, text=decoded_headings[key])
+            self.decoded_group_tree.column(key, width=decoded_widths[key], anchor=tk.W)
+        self.decoded_group_tree.bind("<<TreeviewSelect>>", self._on_group_row_selected)
+
+    def open_decode_rule_window(self) -> None:
+        if self.rule_window is not None and self.rule_window.winfo_exists():
+            self.rule_window.deiconify()
+            self.rule_window.lift()
+            self.rule_window.focus_force()
+            return
+
+        self.rule_window = tk.Toplevel(self)
+        self.rule_window.title("Decode Rule Configuration")
+        self.rule_window.geometry("980x560")
+        self.rule_window.minsize(860, 460)
+        self.rule_window.transient(self)
+        self.rule_window.protocol("WM_DELETE_WINDOW", self._on_rule_window_close)
+
+        container = ttk.Frame(self.rule_window, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        top_row = ttk.Frame(container)
+        top_row.pack(fill=tk.X)
+        ttk.Label(top_row, text="CAN ID:").pack(side=tk.LEFT)
+        ttk.Entry(top_row, textvariable=self.rule_id_var, width=14).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Button(top_row, text="Use Selected ID", command=self.use_selected_group_id).pack(side=tk.LEFT)
+        ttk.Button(top_row, text="Set/Update Rule", command=self.set_custom_decode_rule).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(top_row, text="Delete Rule", command=self.delete_custom_decode_rule).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(
+            container,
+            text="Define each field by byte-group (start byte + datatype + endianness).",
+            anchor=tk.W,
+        ).pack(fill=tk.X, pady=(6, 0))
+
+        field_controls = ttk.Frame(container)
+        field_controls.pack(fill=tk.X, pady=(8, 6))
+        ttk.Label(field_controls, text="Field name:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Entry(field_controls, textvariable=self.rule_field_name_var, width=16).grid(row=0, column=1, sticky=tk.W, padx=(6, 12))
+
+        ttk.Label(field_controls, text="Start byte:").grid(row=0, column=2, sticky=tk.W)
+        ttk.Spinbox(field_controls, from_=0, to=63, textvariable=self.rule_field_start_var, width=6).grid(
+            row=0,
+            column=3,
             sticky=tk.W,
             padx=(6, 12),
-            pady=(8, 0),
         )
 
-        ttk.Label(rule_controls, text="Type:").grid(row=1, column=2, sticky=tk.W, pady=(8, 0))
+        ttk.Label(field_controls, text="Type:").grid(row=0, column=4, sticky=tk.W)
         ttk.Combobox(
-            rule_controls,
+            field_controls,
             textvariable=self.rule_field_type_var,
             values=RULE_TYPE_OPTIONS,
             state="readonly",
             width=8,
-        ).grid(row=1, column=3, sticky=tk.W, padx=(6, 12), pady=(8, 0))
+        ).grid(row=0, column=5, sticky=tk.W, padx=(6, 12))
 
-        ttk.Label(rule_controls, text="Endian:").grid(row=1, column=4, sticky=tk.W, pady=(8, 0))
+        ttk.Label(field_controls, text="Endian:").grid(row=0, column=6, sticky=tk.W)
         ttk.Combobox(
-            rule_controls,
+            field_controls,
             textvariable=self.rule_field_endian_var,
             values=RULE_ENDIAN_OPTIONS,
             state="readonly",
             width=6,
-        ).grid(row=1, column=5, sticky=tk.W, padx=(6, 12), pady=(8, 0))
+        ).grid(row=0, column=7, sticky=tk.W, padx=(6, 12))
 
-        ttk.Button(rule_controls, text="Add Field", command=self.add_rule_field).grid(
-            row=1,
-            column=6,
-            sticky=tk.W,
-            padx=(0, 6),
-            pady=(8, 0),
-        )
-        ttk.Button(rule_controls, text="Update Field", command=self.update_rule_field).grid(
-            row=1,
-            column=7,
-            sticky=tk.W,
-            padx=(0, 6),
-            pady=(8, 0),
-        )
-        ttk.Button(rule_controls, text="Remove Field", command=self.remove_rule_field).grid(
-            row=1,
-            column=8,
-            sticky=tk.W,
-            padx=(0, 6),
-            pady=(8, 0),
-        )
-        ttk.Button(rule_controls, text="Clear Fields", command=self.clear_rule_fields).grid(
-            row=1,
-            column=9,
-            sticky=tk.W,
-            pady=(8, 0),
-        )
+        ttk.Button(field_controls, text="Add Field", command=self.add_rule_field).grid(row=0, column=8, sticky=tk.W, padx=(0, 6))
+        ttk.Button(field_controls, text="Update Field", command=self.update_rule_field).grid(row=0, column=9, sticky=tk.W, padx=(0, 6))
+        ttk.Button(field_controls, text="Remove Field", command=self.remove_rule_field).grid(row=0, column=10, sticky=tk.W, padx=(0, 6))
+        ttk.Button(field_controls, text="Clear Fields", command=self.clear_rule_fields).grid(row=0, column=11, sticky=tk.W)
 
-        field_table_frame = ttk.Frame(rule_frame)
-        field_table_frame.pack(fill=tk.X, padx=8)
+        fields_frame = ttk.LabelFrame(container, text="Rule Fields")
+        fields_frame.pack(fill=tk.BOTH, expand=False)
         self.rule_fields_tree = ttk.Treeview(
-            field_table_frame,
-            columns=("name", "type", "endian"),
+            fields_frame,
+            columns=("name", "start", "type", "endian"),
             show="headings",
-            height=4,
+            height=6,
         )
-        self.rule_fields_tree.pack(fill=tk.X, expand=False)
+        self.rule_fields_tree.pack(fill=tk.BOTH, expand=True)
         self.rule_fields_tree.heading("name", text="Field")
+        self.rule_fields_tree.heading("start", text="Start Byte")
         self.rule_fields_tree.heading("type", text="Type")
         self.rule_fields_tree.heading("endian", text="Endian")
-        self.rule_fields_tree.column("name", width=180, anchor=tk.W)
-        self.rule_fields_tree.column("type", width=110, anchor=tk.W)
-        self.rule_fields_tree.column("endian", width=90, anchor=tk.W)
+        self.rule_fields_tree.column("name", width=240, anchor=tk.W)
+        self.rule_fields_tree.column("start", width=110, anchor=tk.W)
+        self.rule_fields_tree.column("type", width=120, anchor=tk.W)
+        self.rule_fields_tree.column("endian", width=110, anchor=tk.W)
         self.rule_fields_tree.bind("<<TreeviewSelect>>", self._on_rule_field_selected)
 
-        action_row = ttk.Frame(rule_frame)
-        action_row.pack(fill=tk.X, padx=8, pady=(6, 4))
-        ttk.Button(action_row, text="Use Selected ID", command=self.use_selected_group_id).pack(side=tk.LEFT)
-        ttk.Button(action_row, text="Set/Update Rule", command=self.set_custom_decode_rule).pack(side=tk.LEFT)
-        ttk.Button(action_row, text="Delete Rule", command=self.delete_custom_decode_rule).pack(side=tk.LEFT, padx=(6, 0))
-
-        rule_table_frame = ttk.Frame(rule_frame)
-        rule_table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
-
-        self.decode_rule_tree = ttk.Treeview(
-            rule_table_frame,
-            columns=("id", "summary"),
-            show="headings",
-            height=4,
-        )
+        rules_frame = ttk.LabelFrame(container, text="Saved Rules")
+        rules_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        self.decode_rule_tree = ttk.Treeview(rules_frame, columns=("id", "summary"), show="headings", height=6)
         self.decode_rule_tree.pack(fill=tk.BOTH, expand=True)
         self.decode_rule_tree.heading("id", text="CAN ID")
         self.decode_rule_tree.heading("summary", text="Rule Summary")
-        self.decode_rule_tree.column("id", width=110, anchor=tk.W)
-        self.decode_rule_tree.column("summary", width=540, anchor=tk.W)
+        self.decode_rule_tree.column("id", width=120, anchor=tk.W)
+        self.decode_rule_tree.column("summary", width=700, anchor=tk.W)
         self.decode_rule_tree.bind("<<TreeviewSelect>>", self._on_decode_rule_selected)
+
+        self._populate_decode_rule_tree()
+
+    def _on_rule_window_close(self) -> None:
+        if self.rule_window is not None and self.rule_window.winfo_exists():
+            self.rule_window.destroy()
+        self.rule_window = None
+        self.rule_fields_tree = None
+        self.decode_rule_tree = None
+        self.decode_rule_tree_items = {}
+
+    def _populate_decode_rule_tree(self) -> None:
+        if self.decode_rule_tree is None:
+            return
+
+        for item in self.decode_rule_tree.get_children():
+            self.decode_rule_tree.delete(item)
+        self.decode_rule_tree_items = {}
+
+        sorted_ids = sorted(set(self.custom_decode_fields_by_id.keys()) | set(self.custom_decode_specs_by_id.keys()))
+        for can_id in sorted_ids:
+            field_defs = self.custom_decode_fields_by_id.get(can_id)
+            if field_defs is None:
+                decode_spec = self.custom_decode_specs_by_id.get(can_id, "")
+                field_defs = self._spec_to_field_defs(decode_spec) if decode_spec else []
+            self._upsert_decode_rule_row(can_id, field_defs)
 
     def _set_connected_ui(self, connected: bool) -> None:
         self.connect_btn.configure(state=tk.DISABLED if connected else tk.NORMAL)
@@ -780,14 +829,6 @@ class CanGuiApp(tk.Tk):
             frame_type = "EXT" if ext else "STD"
             data_kind = "RTR" if remote else "DATA"
             data_text = " ".join(f"{byte:02X}" for byte in payload)
-            line = (
-                f"[{now}] ID=0x{frame_id:X} {frame_type} {data_kind} "
-                f"DLC={dlc} DATA={data_text:<23} TS=0x{timestamp:08X}\n"
-            )
-
-            target = self.rx_text_can1 if channel == 0 else self.rx_text_can2
-            target.insert(tk.END, line)
-            target.see(tk.END)
 
             record = {
                 "host_time": now,
@@ -947,6 +988,10 @@ class CanGuiApp(tk.Tk):
         if not payload:
             return ""
 
+        custom_fields = self.custom_decode_fields_by_id.get(frame_id)
+        if custom_fields:
+            return self._decode_with_field_defs(payload, custom_fields)
+
         spec = (decode_spec if decode_spec is not None else self.decode_specs_by_id.get(frame_id, "")).strip()
         if not spec:
             return ""
@@ -1020,23 +1065,112 @@ class CanGuiApp(tk.Tk):
         suffix = "_be" if endian == "BE" else "_le"
         return f"{base_type}{suffix}"
 
+    def _field_size(self, base_type: str) -> int:
+        if base_type == "bool":
+            return 1
+
+        type_info = DECODE_BASE_INFO.get(base_type)
+        if type_info is None:
+            raise ValueError(f"unsupported decode base '{base_type}'")
+
+        return int(type_info[1])
+
+    def _decode_with_field_defs(self, payload: list[int], field_defs: list[dict[str, str]]) -> str:
+        if not field_defs:
+            return ""
+
+        parsed: list[str] = []
+        used_ranges: list[tuple[int, int]] = []
+
+        for field in field_defs:
+            field_name = str(field.get("name", "")).strip()
+            if not field_name:
+                raise ValueError("field name is required")
+
+            base_type = str(field.get("type", "")).strip().lower()
+            if not base_type:
+                raise ValueError(f"decode type missing for field '{field_name}'")
+
+            start_text = str(field.get("start", "0")).strip() or "0"
+            try:
+                start = int(start_text, 0)
+            except ValueError as exc:
+                raise ValueError(f"invalid start byte '{start_text}' for field '{field_name}'") from exc
+
+            if start < 0:
+                raise ValueError(f"start byte must be >= 0 for field '{field_name}'")
+
+            endian_text = str(field.get("endian", "LE")).strip().upper()
+            endian = ">" if endian_text == "BE" else "<"
+
+            size = self._field_size(base_type)
+            end = start + size
+            if end > len(payload):
+                raise ValueError(f"{field_name} expects bytes [{start}..{end - 1}]")
+
+            used_ranges.append((start, end))
+
+            if base_type == "bool":
+                value = payload[start] != 0
+                parsed.append(f"{field_name}={'true' if value else 'false'}")
+                continue
+
+            type_info = DECODE_BASE_INFO.get(base_type)
+            if type_info is None:
+                raise ValueError(f"unsupported decode base '{base_type}'")
+
+            fmt_char, _ = type_info
+            raw = bytes(payload[start:end])
+            value = struct.unpack(endian + fmt_char, raw)[0]
+            if isinstance(value, float):
+                parsed.append(f"{field_name}={value:.6g}")
+            else:
+                parsed.append(f"{field_name}={value}")
+
+        consumed = [False] * len(payload)
+        for start, end in used_ranges:
+            for idx in range(start, end):
+                if 0 <= idx < len(consumed):
+                    consumed[idx] = True
+
+        tail = [payload[idx] for idx, is_used in enumerate(consumed) if not is_used]
+        if tail:
+            parsed.append(f"raw_tail={' '.join(f'{byte:02X}' for byte in tail)}")
+
+        return ", ".join(parsed)
+
     def _field_defs_to_spec(self, field_defs: list[dict[str, str]]) -> str:
         parts: list[str] = []
         for field in field_defs:
             token = self._field_def_to_token(field)
-            parts.append(f"{field['name']}:{token}")
+            start_text = str(field.get("start", "0")).strip() or "0"
+            parts.append(f"{field['name']}@{start_text}:{token}")
         return ", ".join(parts)
 
     def _spec_to_field_defs(self, decode_spec: str) -> list[dict[str, str]]:
         fields = [part.strip() for part in decode_spec.split(",") if part.strip()]
         parsed: list[dict[str, str]] = []
+        running_offset = 0
 
         for index, field_text in enumerate(fields, start=1):
             field_name, field_type = self._split_decode_field(field_text, index)
+            field_start = running_offset
+            if "@" in field_name:
+                raw_name, raw_start = field_name.rsplit("@", 1)
+                raw_name = raw_name.strip()
+                if raw_name:
+                    field_name = raw_name
+                try:
+                    field_start = int(raw_start.strip(), 0)
+                except ValueError as exc:
+                    raise ValueError(f"invalid start byte '{raw_start}' for field '{field_name}'") from exc
+
             base_type, endian_symbol = self._resolve_decode_type(field_type)
+            running_offset = field_start + self._field_size(base_type)
             parsed.append(
                 {
                     "name": field_name,
+                    "start": str(field_start),
                     "type": base_type,
                     "endian": "BE" if endian_symbol == ">" else "LE",
                 }
@@ -1045,22 +1179,29 @@ class CanGuiApp(tk.Tk):
         return parsed
 
     def _get_editor_field_defs(self) -> list[dict[str, str]]:
+        if self.rule_fields_tree is None:
+            return []
+
         field_defs: list[dict[str, str]] = []
         for item in self.rule_fields_tree.get_children():
             values = self.rule_fields_tree.item(item, "values")
-            if len(values) < 3:
+            if len(values) < 4:
                 continue
             field_defs.append(
                 {
                     "name": str(values[0]).strip(),
-                    "type": str(values[1]).strip().lower(),
-                    "endian": str(values[2]).strip().upper() or "LE",
+                    "start": str(values[1]).strip() or "0",
+                    "type": str(values[2]).strip().lower(),
+                    "endian": str(values[3]).strip().upper() or "LE",
                 }
             )
 
         return field_defs
 
     def _load_editor_field_defs(self, field_defs: list[dict[str, str]]) -> None:
+        if self.rule_fields_tree is None:
+            return
+
         for item in self.rule_fields_tree.get_children():
             self.rule_fields_tree.delete(item)
 
@@ -1068,35 +1209,59 @@ class CanGuiApp(tk.Tk):
             self.rule_fields_tree.insert(
                 "",
                 tk.END,
-                values=(field["name"], field["type"], field["endian"]),
+                values=(
+                    field.get("name", ""),
+                    str(field.get("start", "0")),
+                    field.get("type", "u8"),
+                    field.get("endian", "LE"),
+                ),
             )
 
         next_index = len(field_defs) + 1
         self.rule_field_name_var.set(f"field{next_index}")
+        self.rule_field_start_var.set("0")
 
     def _rule_summary(self, field_defs: list[dict[str, str]]) -> str:
         return self._field_defs_to_spec(field_defs)
 
     def _on_rule_field_selected(self, _event: object) -> None:
+        if self.rule_fields_tree is None:
+            return
+
         selected = self.rule_fields_tree.selection()
         if len(selected) != 1:
             return
 
         values = self.rule_fields_tree.item(selected[0], "values")
-        if len(values) < 3:
+        if len(values) < 4:
             return
 
         self.rule_field_name_var.set(str(values[0]))
-        self.rule_field_type_var.set(str(values[1]))
-        self.rule_field_endian_var.set(str(values[2]))
+        self.rule_field_start_var.set(str(values[1]))
+        self.rule_field_type_var.set(str(values[2]))
+        self.rule_field_endian_var.set(str(values[3]))
 
     def add_rule_field(self) -> None:
+        if self.rule_fields_tree is None:
+            return
+
         field_name = self.rule_field_name_var.get().strip()
+        field_start_text = self.rule_field_start_var.get().strip() or "0"
         field_type = self.rule_field_type_var.get().strip().lower()
         field_endian = self.rule_field_endian_var.get().strip().upper() or "LE"
 
         if not field_name:
             messagebox.showerror("Decoder Rule Error", "Field name is required")
+            return
+
+        try:
+            field_start = int(field_start_text, 0)
+        except ValueError:
+            messagebox.showerror("Decoder Rule Error", "Start byte must be an integer")
+            return
+
+        if field_start < 0:
+            messagebox.showerror("Decoder Rule Error", "Start byte must be >= 0")
             return
 
         if field_type not in RULE_TYPE_OPTIONS:
@@ -1108,25 +1273,52 @@ class CanGuiApp(tk.Tk):
             return
 
         existing_names = {str(self.rule_fields_tree.item(item, "values")[0]) for item in self.rule_fields_tree.get_children()}
+        existing_starts: set[int] = set()
+        for item in self.rule_fields_tree.get_children():
+            values = self.rule_fields_tree.item(item, "values")
+            if len(values) < 2:
+                continue
+            try:
+                existing_starts.add(int(str(values[1]), 0))
+            except ValueError:
+                continue
         if field_name in existing_names:
             messagebox.showerror("Decoder Rule Error", f"Field '{field_name}' already exists")
             return
+        if field_start in existing_starts:
+            messagebox.showerror("Decoder Rule Error", f"Start byte {field_start} already exists")
+            return
 
-        self.rule_fields_tree.insert("", tk.END, values=(field_name, field_type, field_endian))
+        self.rule_fields_tree.insert("", tk.END, values=(field_name, str(field_start), field_type, field_endian))
         self.rule_field_name_var.set(f"field{len(self.rule_fields_tree.get_children()) + 1}")
+        self.rule_field_start_var.set("0")
 
     def update_rule_field(self) -> None:
+        if self.rule_fields_tree is None:
+            return
+
         selected = self.rule_fields_tree.selection()
         if len(selected) != 1:
             messagebox.showinfo("Decoder Rule", "Select one field row to update")
             return
 
         field_name = self.rule_field_name_var.get().strip()
+        field_start_text = self.rule_field_start_var.get().strip() or "0"
         field_type = self.rule_field_type_var.get().strip().lower()
         field_endian = self.rule_field_endian_var.get().strip().upper() or "LE"
 
         if not field_name:
             messagebox.showerror("Decoder Rule Error", "Field name is required")
+            return
+
+        try:
+            field_start = int(field_start_text, 0)
+        except ValueError:
+            messagebox.showerror("Decoder Rule Error", "Start byte must be an integer")
+            return
+
+        if field_start < 0:
+            messagebox.showerror("Decoder Rule Error", "Start byte must be >= 0")
             return
 
         if field_type not in RULE_TYPE_OPTIONS:
@@ -1142,13 +1334,25 @@ class CanGuiApp(tk.Tk):
             if item == target:
                 continue
             values = self.rule_fields_tree.item(item, "values")
-            if values and str(values[0]) == field_name:
+            if not values:
+                continue
+            if str(values[0]) == field_name:
                 messagebox.showerror("Decoder Rule Error", f"Field '{field_name}' already exists")
                 return
+            try:
+                existing_start = int(str(values[1]), 0)
+            except ValueError:
+                existing_start = None
+            if existing_start == field_start:
+                messagebox.showerror("Decoder Rule Error", f"Start byte {field_start} already exists")
+                return
 
-        self.rule_fields_tree.item(target, values=(field_name, field_type, field_endian))
+        self.rule_fields_tree.item(target, values=(field_name, str(field_start), field_type, field_endian))
 
     def remove_rule_field(self) -> None:
+        if self.rule_fields_tree is None:
+            return
+
         selected = self.rule_fields_tree.selection()
         if not selected:
             return
@@ -1157,11 +1361,18 @@ class CanGuiApp(tk.Tk):
             self.rule_fields_tree.delete(item)
 
     def clear_rule_fields(self) -> None:
+        if self.rule_fields_tree is None:
+            return
+
         for item in self.rule_fields_tree.get_children():
             self.rule_fields_tree.delete(item)
         self.rule_field_name_var.set("field1")
+        self.rule_field_start_var.set("0")
 
     def _upsert_decode_rule_row(self, can_id: int, field_defs: list[dict[str, str]]) -> None:
+        if self.decode_rule_tree is None:
+            return
+
         values = (f"0x{can_id:X}", self._rule_summary(field_defs))
         existing = self.decode_rule_tree_items.get(can_id)
 
@@ -1173,11 +1384,18 @@ class CanGuiApp(tk.Tk):
         self.decode_rule_tree_items[can_id] = item
 
     def _remove_decode_rule_row(self, can_id: int) -> None:
+        if self.decode_rule_tree is None:
+            self.decode_rule_tree_items.pop(can_id, None)
+            return
+
         item = self.decode_rule_tree_items.pop(can_id, None)
         if item and self.decode_rule_tree.exists(item):
             self.decode_rule_tree.delete(item)
 
     def _on_decode_rule_selected(self, _event: object) -> None:
+        if self.decode_rule_tree is None:
+            return
+
         selected = self.decode_rule_tree.selection()
         if len(selected) != 1:
             return
@@ -1198,11 +1416,12 @@ class CanGuiApp(tk.Tk):
         self._load_editor_field_defs(field_defs)
 
     def _on_group_row_selected(self, _event: object) -> None:
-        selected = self.group_tree.selection()
+        tree = _event.widget if isinstance(_event.widget, ttk.Treeview) else self.group_tree
+        selected = tree.selection()
         if len(selected) != 1:
             return
 
-        values = self.group_tree.item(selected[0], "values")
+        values = tree.item(selected[0], "values")
         if not values:
             return
 
@@ -1217,11 +1436,16 @@ class CanGuiApp(tk.Tk):
 
     def use_selected_group_id(self) -> None:
         selected = self.group_tree.selection()
+        source = self.group_tree
+        if len(selected) != 1:
+            selected = self.decoded_group_tree.selection()
+            source = self.decoded_group_tree
+
         if len(selected) != 1:
             messagebox.showinfo("Decoder Rule", "Select one row in Grouped by CAN ID first")
             return
 
-        values = self.group_tree.item(selected[0], "values")
+        values = source.item(selected[0], "values")
         if not values:
             return
 
@@ -1240,6 +1464,55 @@ class CanGuiApp(tk.Tk):
             field_defs = self._get_editor_field_defs()
             if not field_defs:
                 raise ValueError("Add at least one field before saving the rule")
+
+            normalized: list[dict[str, str]] = []
+            used_ranges: list[tuple[int, int, str]] = []
+            for field in field_defs:
+                field_name = str(field.get("name", "")).strip()
+                if not field_name:
+                    raise ValueError("Field name is required")
+
+                start_text = str(field.get("start", "0")).strip() or "0"
+                try:
+                    start = int(start_text, 0)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid start byte '{start_text}' for field '{field_name}'") from exc
+
+                if start < 0:
+                    raise ValueError(f"Start byte must be >= 0 for field '{field_name}'")
+
+                field_type = str(field.get("type", "")).strip().lower()
+                if field_type not in RULE_TYPE_OPTIONS:
+                    raise ValueError(f"Unsupported type '{field_type}' for field '{field_name}'")
+
+                field_endian = str(field.get("endian", "LE")).strip().upper() or "LE"
+                if field_endian not in RULE_ENDIAN_OPTIONS:
+                    raise ValueError(f"Endian must be LE or BE for field '{field_name}'")
+
+                size = self._field_size(field_type)
+                end = start + size
+                if end > MAX_CAN_DATA_LEN:
+                    raise ValueError(
+                        f"Field '{field_name}' needs bytes [{start}..{end - 1}] but CAN payload is only 0..{MAX_CAN_DATA_LEN - 1}"
+                    )
+
+                for existing_start, existing_end, existing_name in used_ranges:
+                    if max(start, existing_start) < min(end, existing_end):
+                        raise ValueError(
+                            f"Field '{field_name}' overlaps with '{existing_name}'"
+                        )
+
+                used_ranges.append((start, end, field_name))
+                normalized.append(
+                    {
+                        "name": field_name,
+                        "start": str(start),
+                        "type": field_type,
+                        "endian": field_endian,
+                    }
+                )
+
+            field_defs = sorted(normalized, key=lambda field: int(str(field.get("start", "0")), 0))
             decode_spec = self._field_defs_to_spec(field_defs)
             self._spec_to_field_defs(decode_spec)
         except Exception as exc:
@@ -1248,13 +1521,14 @@ class CanGuiApp(tk.Tk):
 
         self.custom_decode_specs_by_id[can_id] = decode_spec
         self.custom_decode_fields_by_id[can_id] = field_defs
+        self._load_editor_field_defs(field_defs)
         self._upsert_decode_rule_row(can_id, field_defs)
         self._refresh_decode_specs_by_id()
         self._set_status(f"Decoder rule set for ID 0x{can_id:X}")
 
     def delete_custom_decode_rule(self) -> None:
         can_id_text = self.rule_id_var.get().strip()
-        if not can_id_text:
+        if not can_id_text and self.decode_rule_tree is not None:
             selected = self.decode_rule_tree.selection()
             if len(selected) == 1:
                 values = self.decode_rule_tree.item(selected[0], "values")
@@ -1289,7 +1563,7 @@ class CanGuiApp(tk.Tk):
                     entry["decoded"] = f"decode-error: {exc}"
             self._upsert_grouped_row(can_id, entry)
 
-    def _grouped_row_values(self, can_id: int, entry: dict[str, object]) -> tuple[str, ...]:
+    def _grouped_raw_row_values(self, can_id: int, entry: dict[str, object]) -> tuple[str, ...]:
         return (
             f"0x{can_id:X}",
             str(entry.get("format", "")),
@@ -1300,20 +1574,41 @@ class CanGuiApp(tk.Tk):
             str(entry.get("last_if", "")),
             str(entry.get("dlc", "")),
             str(entry.get("raw", "")),
+            str(entry.get("last_seen", "")),
+        )
+
+    def _grouped_decoded_row_values(self, can_id: int, entry: dict[str, object]) -> tuple[str, ...]:
+        return (
+            f"0x{can_id:X}",
+            str(entry.get("format", "")),
+            str(entry.get("type", "")),
+            str(entry.get("tx_count", 0)),
+            str(entry.get("rx_count", 0)),
+            str(entry.get("last_dir", "")),
+            str(entry.get("last_if", "")),
+            str(entry.get("dlc", "")),
             str(entry.get("decoded", "")),
             str(entry.get("last_seen", "")),
         )
 
     def _upsert_grouped_row(self, can_id: int, entry: dict[str, object]) -> None:
-        values = self._grouped_row_values(can_id, entry)
-        existing = self.group_tree_items.get(can_id)
+        raw_values = self._grouped_raw_row_values(can_id, entry)
+        raw_existing = self.group_tree_items.get(can_id)
 
-        if existing and self.group_tree.exists(existing):
-            self.group_tree.item(existing, values=values)
-            return
+        if raw_existing and self.group_tree.exists(raw_existing):
+            self.group_tree.item(raw_existing, values=raw_values)
+        else:
+            raw_item = self.group_tree.insert("", tk.END, values=raw_values)
+            self.group_tree_items[can_id] = raw_item
 
-        item = self.group_tree.insert("", tk.END, values=values)
-        self.group_tree_items[can_id] = item
+        decoded_values = self._grouped_decoded_row_values(can_id, entry)
+        decoded_existing = self.decoded_group_tree_items.get(can_id)
+
+        if decoded_existing and self.decoded_group_tree.exists(decoded_existing):
+            self.decoded_group_tree.item(decoded_existing, values=decoded_values)
+        else:
+            decoded_item = self.decoded_group_tree.insert("", tk.END, values=decoded_values)
+            self.decoded_group_tree_items[can_id] = decoded_item
 
     def _record_grouped_packet(
         self,
@@ -1854,22 +2149,20 @@ class CanGuiApp(tk.Tk):
     def clear_grouped_view(self) -> None:
         self.grouped_packets_by_id.clear()
         self.group_tree_items.clear()
+        self.decoded_group_tree_items.clear()
         for item in self.group_tree.get_children():
             self.group_tree.delete(item)
+        for item in self.decoded_group_tree.get_children():
+            self.decoded_group_tree.delete(item)
         self._set_status("Cleared grouped-by-ID view")
 
     def clear_can1_log(self) -> None:
-        self._clear_text(self.rx_text_can1)
         self.rx_records_can1.clear()
         self._set_status("Cleared CAN1 RX log")
 
     def clear_can2_log(self) -> None:
-        self._clear_text(self.rx_text_can2)
         self.rx_records_can2.clear()
         self._set_status("Cleared CAN2 RX log")
-
-    def _clear_text(self, widget: tk.Text) -> None:
-        widget.delete("1.0", tk.END)
 
     def _on_close(self) -> None:
         try:
